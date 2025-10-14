@@ -1,6 +1,7 @@
 {
   "domain": "leaflet_hems",
   "name": "Leaflet HEMS",
+  "author": "Consolinno Energy GmbH",
   "codeowners": ["@ljonka"],
   "config_flow": true,
   "dependencies": [],

@@ -1,5 +1,9 @@
 # Leaflet HEMS Integration for Home Assistant
 
+![Consolinno Energy logo](custom_components/leaflet_hems/logo.png)
+
+Consolinno Energy GmbH — Integration "Leaflet HEMS"
+
 This integration connects Home Assistant to Consolinno Leaflet HEMS (Heim Energie Management System) devices, which are based on the nymea framework. It allows you to monitor energy data such as grid consumption, PV generation, battery status, and more.
 
 ## Features

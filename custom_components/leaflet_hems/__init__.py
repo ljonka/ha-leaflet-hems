@@ -129,7 +129,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, nymea_uuid)},
-        manufacturer="Consolinno",
+        manufacturer="Consolinno Energy GmbH",
         name=nymea_name or f"{NAME} {nymea_uuid[:8]}",
         model="Leaflet HEMS",
         sw_version=VERSION,
