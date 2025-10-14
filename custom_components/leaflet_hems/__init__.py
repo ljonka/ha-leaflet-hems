@@ -3,12 +3,14 @@
 import asyncio
 import logging
 from datetime import timedelta
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
+from .sensor import POWER_BALANCE_SENSORS
 
 from .const import (
     DOMAIN,
@@ -33,7 +35,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     This creates a persistent NymeaClient and stores it in hass.data[DOMAIN][entry_id]
     so other parts of the integration can reuse the same TCP+TLS connection.
     """
-    _LOGGER.debug("Setting up Leaflet HEMS integration for %s", entry.title)
+    _LOGGER.info("Setting up Leaflet HEMS integration for %s", entry.title)
 
     host = entry.data.get(CONF_HOST)
     port = entry.data.get(CONF_PORT)
@@ -59,14 +61,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # The earlier handshake during config flow provided details already; this hello
         # will also validate the connection and keep the session ready.
         hello_params = await nymea_client.hello()
-        _LOGGER.debug("Persistent client hello params: %s", hello_params)
         
         # Set token and perform new handshake if token is available
         if token:
             nymea_client.update_token(token)
             # Perform new handshake with token
             hello_params_with_token = await nymea_client.hello()
-            _LOGGER.debug("Hello with token successful: %s", hello_params_with_token.get("uuid"))
         
         # Start reader loop for notifications and responses
         await nymea_client.start_reader_loop()
@@ -83,9 +83,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 notifications_enabled = True
                 _LOGGER.info("Energy notifications enabled successfully")
             else:
-                _LOGGER.debug("Failed to enable notifications: %s", notify_response.get("error"))
+                _LOGGER.warning("Failed to enable notifications: %s", notify_response.get("error"))
         except Exception as e:
-            _LOGGER.debug("Error enabling notifications: %s", e)
+            _LOGGER.warning("Error enabling notifications: %s", e)
             
     except Exception as exc:
         _LOGGER.warning("Couldn't establish persistent connection to %s:%s: %s", host, port, exc)
@@ -109,12 +109,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "notifications_enabled": notifications_enabled,
     }
 
+    # Register coordinator notification callback for event-driven updates
+    if notifications_enabled:
+        try:
+            token_cb = nymea_client.register_notification_callback(coordinator._handle_notification)
+            hass.data[DOMAIN][entry.entry_id]["notification_token"] = token_cb
+        except Exception as e:
+            _LOGGER.warning("Failed to register notification callback: %s", e)
+
 
     # Forward entry setups to platforms (sensor)
     try:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except Exception as exc:
-        _LOGGER.debug("Failed to forward entry setups for %s: %s", entry.entry_id, exc)
+        _LOGGER.warning("Failed to forward entry setups for %s: %s", entry.entry_id, exc)
 
     # Add device to device registry
     device_registry = dr.async_get(hass)
@@ -133,16 +141,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry and close the persistent NymeaClient."""
-    _LOGGER.debug("Unloading Leaflet HEMS integration for %s", entry.title)
+    _LOGGER.info("Unloading Leaflet HEMS integration for %s", entry.title)
 
     entry_data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if entry_data:
         client: Optional[NymeaClient] = entry_data.get("client")
+        # Unregister notification callback if present
+        token = entry_data.get("notification_token")
+        if token and client:
+            try:
+                client.unregister_notification_callback(token)
+            except Exception as exc:
+                _LOGGER.warning("Failed to unregister notification callback for %s: %s", entry.title, exc)
+
         if client:
             try:
                 await client.close()
             except Exception as exc:
-                _LOGGER.debug("Error closing NymeaClient for %s: %s", entry.title, exc)
+                _LOGGER.warning("Error closing NymeaClient for %s: %s", entry.title, exc)
 
     # If you have platforms to unload, do that here (currently none)
     # unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
@@ -160,18 +176,21 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=f"{NAME} {nymea_name}",
-            update_interval=timedelta(seconds=30),
+            update_interval=None,
         )
         self.client = client
         self.nymea_name = nymea_name
 
+        # Keys from sensor definitions that we care about for notifications
+        self._keys = {s["key"] for s in POWER_BALANCE_SENSORS}
+        self._data: Dict[str, Any] = {}
+
     async def _async_update_data(self):
-        """Fetch data from Leaflet HEMS."""
+        """Fetch data from Leaflet HEMS (used for initial fetch/fallback)."""
         try:
             response = await self.client.send_request_with_response("Energy.GetPowerBalance", timeout=10.0)
             
             if response.get("status") == "success" and response.get("params"):
-                _LOGGER.debug("Power balance data fetched successfully")
                 return response["params"]
             else:
                 _LOGGER.warning("Energy.GetPowerBalance failed: %s", response.get("error"))
@@ -180,3 +199,22 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         except Exception as e:
             _LOGGER.error("Error fetching power balance data: %s", e)
             raise
+
+    @callback
+    def _handle_notification(self, notification: Dict[str, Any]) -> None:
+        """Handle notifications from the Nymea client and push updates to the coordinator."""
+        method = notification.get("method") or notification.get("notification")
+        if not method or ("Energy" not in method and "PowerBalance" not in method and "Power" not in method):
+            return
+
+        params = notification.get("params", {}) or notification
+        # Merge into existing coordinator data
+        new_data = dict(self.data or {})
+        changed = False
+        for k in self._keys:
+            if k in params:
+                if new_data.get(k) != params[k]:
+                    new_data[k] = params[k]
+                    changed = True
+        if changed:
+            self.async_set_updated_data(new_data)

@@ -121,10 +121,10 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                                             new_data = dict(entry.data)
                                             new_data[CONF_NYMEA_TOKEN] = token
                                             self.hass.config_entries.async_update_entry(entry, data=new_data)
-                                            _LOGGER.debug("Persisted token to config entry %s", entry.entry_id)
+                                            _LOGGER.info("Persisted token to config entry %s", entry.entry_id)
                                             break
                                 except Exception as e:
-                                    _LOGGER.debug("Failed to persist token to config entry: %s", e)
+                                            _LOGGER.warning("Failed to persist token to config entry: %s", e)
                                 return result
                             # Authentication failed — fall through to show auth form with error
                             errors["base"] = "invalid_auth"
@@ -282,8 +282,7 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             # Convert to JSON string and add newline (JSON-RPC line protocol)
             message = json.dumps(handshake_payload) + "\n"
             
-            _LOGGER.debug("Connecting to %s:%s via TCP+TLS", host, port)
-            _LOGGER.debug("Sending handshake message: %s", message.strip())
+            _LOGGER.info("Connecting to %s:%s via TCP+TLS", host, port)
             
             # Open TCP+TLS connection
             reader, writer = await asyncio.wait_for(
@@ -298,8 +297,6 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             # Read the response (assuming line-based protocol)
             response_line = await asyncio.wait_for(reader.readline(), timeout=10)
             response_text = response_line.decode('utf-8').strip()
-            
-            _LOGGER.debug("Received handshake response: %s", response_text)
             
             # Parse JSON response
             result = json.loads(response_text)
@@ -346,7 +343,7 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                             try:
                                 _ = t.result()
                             except Exception as exc:
-                                _LOGGER.debug("wait_closed raised: %s", exc)
+                                _LOGGER.warning("wait_closed raised: %s", exc)
                         try:
                             task.add_done_callback(_on_wait_closed)
                         except Exception:
@@ -354,7 +351,7 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                     except Exception:
                         pass
                 except Exception as e:
-                    _LOGGER.debug("Error closing connection: %s", e)
+                    _LOGGER.warning("Error closing connection: %s", e)
                     
         return None
 
@@ -389,8 +386,8 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
             message = json.dumps(auth_payload) + "\n"
 
-            _LOGGER.debug("Attempting authentication for user '%s' with %s:%s", username, host, port)
-            _LOGGER.debug("Sending authentication message: %s", message.strip())
+            _LOGGER.info("Attempting authentication for user '%s' with %s:%s", username, host, port)
+            _LOGGER.info("Attempting authentication for user '%s' with %s:%s", username, host, port)
 
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port, ssl=ssl_context), timeout=10
@@ -401,8 +398,6 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
             response_line = await asyncio.wait_for(reader.readline(), timeout=10)
             response_text = response_line.decode("utf-8").strip()
-
-            _LOGGER.debug("Received authentication response: %s", response_text)
 
             result = json.loads(response_text)
 

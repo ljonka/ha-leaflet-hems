@@ -158,41 +158,12 @@ class LeafletPowerBalanceSensor(CoordinatorEntity, SensorEntity):
     async def async_added_to_hass(self) -> None:
         """Run when entity is added to hass."""
         await super().async_added_to_hass()
-        
-        # Register for notifications if enabled
-        if self._notifications_enabled:
-            self._notification_token = self._client.register_notification_callback(
-                self._handle_notification
-            )
-            _LOGGER.debug("Registered notification callback for %s", self._attr_name)
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity is being removed."""
-        if self._notification_token:
-            self._client.unregister_notification_callback(self._notification_token)
-            _LOGGER.debug("Unregistered notification callback for %s", self._attr_name)
+        # Notifications are handled centrally by the coordinator.
+        return None
 
-    @callback
-    def _handle_notification(self, notification: Dict[str, Any]) -> None:
-        """Handle incoming notifications from nymea."""
-        method = notification.get("method") or notification.get("notification")
-        
-        # Check if this is a power balance related notification
-        if method and ("Energy" in method or "PowerBalance" in method or "Power" in method):
-            _LOGGER.debug("Power balance notification received for %s: %s", self._attr_name, method)
-            
-            # Extract params from notification
-            params = notification.get("params", {})
-            if not params:
-                params = notification  # Sometimes params are at root level
-            
-            # Update the sensor value if our key is present
-            if self._sensor_config["key"] in params:
-                new_value = params[self._sensor_config["key"]]
-                if new_value != self._attr_native_value:
-                    self._attr_native_value = new_value
-                    self.async_write_ha_state()
-                    _LOGGER.debug("Updated %s from notification: %s", self._attr_name, new_value)
 
     @property
     def native_value(self):

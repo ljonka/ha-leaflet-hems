@@ -54,7 +54,7 @@ class NymeaClient:
         self._reader, self._writer = await asyncio.wait_for(
             asyncio.open_connection(host, port, ssl=ssl_context), timeout=timeout
         )
-        _LOGGER.debug("NymeaClient connected to %s:%s", host, port)
+        _LOGGER.info("NymeaClient connected to %s:%s", host, port)
 
     async def close(self) -> None:
         """Close the connection and stop all background tasks.
@@ -76,7 +76,7 @@ class NymeaClient:
                         try:
                             _ = t.result()
                         except Exception as exc:  # pragma: no cover - defensive
-                            _LOGGER.debug("NymeaClient wait_closed raised: %s", exc)
+                            _LOGGER.warning("NymeaClient wait_closed raised: %s", exc)
                     try:
                         task.add_done_callback(_on_wait_closed_done)
                     except Exception:
@@ -85,7 +85,7 @@ class NymeaClient:
                 except Exception:
                     pass
             except Exception as exc:  # pragma: no cover - defensive
-                _LOGGER.debug("Error closing nymea connection: %s", exc)
+                _LOGGER.warning("Error closing nymea connection: %s", exc)
         self._reader = None
         self._writer = None
 
@@ -102,7 +102,6 @@ class NymeaClient:
             payload = dict(payload)  # shallow copy
             payload["token"] = self._token
         msg = json.dumps(payload, ensure_ascii=False) + "\n"
-        _LOGGER.debug("NymeaClient send: %s", msg.strip())
         self._writer.write(msg.encode("utf-8"))
         await self._writer.drain()
 
@@ -121,7 +120,6 @@ class NymeaClient:
             raise RuntimeError("Not connected")
         line = await asyncio.wait_for(self._reader.readline(), timeout=timeout)
         text = line.decode("utf-8").strip()
-        _LOGGER.debug("NymeaClient recv: %s", text)
         return json.loads(text)
 
     async def hello(self, locale: str = "de_DE", timeout: float = 10.0) -> Optional[Dict[str, Any]]:
@@ -192,7 +190,7 @@ class NymeaClient:
             raise RuntimeError("Not connected")
             
         self._reader_task = asyncio.create_task(self._reader_loop())
-        _LOGGER.debug("NymeaClient reader loop started")
+        _LOGGER.info("NymeaClient reader loop started")
 
     async def stop_reader_loop(self) -> None:
         """Stop the background reader loop."""
@@ -203,7 +201,7 @@ class NymeaClient:
             except asyncio.CancelledError:
                 pass
             self._reader_task = None
-            _LOGGER.debug("NymeaClient reader loop stopped")
+            _LOGGER.info("NymeaClient reader loop stopped")
 
     async def _reader_loop(self) -> None:
         """Background task to read incoming messages and dispatch them."""
@@ -218,7 +216,6 @@ class NymeaClient:
                     if not text:
                         continue
                         
-                    _LOGGER.debug("NymeaClient reader loop recv: %s", text)
                     message = json.loads(text)
                     
                     # Check if this is a notification
@@ -235,7 +232,7 @@ class NymeaClient:
                     _LOGGER.warning("Error in reader loop: %s", e)
                     break
         except asyncio.CancelledError:
-            _LOGGER.debug("Reader loop cancelled")
+            _LOGGER.info("Reader loop cancelled")
         except Exception as e:
             _LOGGER.error("Reader loop error: %s", e)
 
@@ -253,7 +250,7 @@ class NymeaClient:
             return
             
         self._keepalive_task = asyncio.create_task(self._keepalive_loop(interval))
-        _LOGGER.debug("NymeaClient keepalive started with interval %.1fs", interval)
+        _LOGGER.info("NymeaClient keepalive started with interval %.1fs", interval)
 
     async def stop_keepalive(self) -> None:
         """Stop sending keepalive messages."""
@@ -264,7 +261,7 @@ class NymeaClient:
             except asyncio.CancelledError:
                 pass
             self._keepalive_task = None
-            _LOGGER.debug("NymeaClient keepalive stopped")
+            _LOGGER.info("NymeaClient keepalive stopped")
 
     async def _keepalive_loop(self, interval: float) -> None:
         """Background task to send periodic keepalive messages."""
@@ -275,11 +272,10 @@ class NymeaClient:
                     payload = {"id": self._next_id, "method": "JSONRPC.KeepAlive", "params": {}}
                     self._next_id += 1
                     await self.send_request(payload)
-                    _LOGGER.debug("Keepalive sent")
                 except Exception as e:
-                    _LOGGER.debug("Keepalive send failed: %s", e)
+                    _LOGGER.warning("Keepalive send failed: %s", e)
         except asyncio.CancelledError:
-            _LOGGER.debug("Keepalive loop cancelled")
+            _LOGGER.info("Keepalive loop cancelled")
 
     async def send_request_with_response(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Dict[str, Any]:
         """Send a request and wait for the response, compatible with reader loop."""
