@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  homeassistant:
+    # This file extends docker-compose.yml
+    # Add or override settings here for development
+    volumes:
+      # Mount the custom_components directory from the host into the container
+      # This allows changes to be reflected immediately without rebuilding the Docker image.
+      - ./custom_components:/config/custom_components:rw
+      # Mount the tests directory if you need to test code directly in the container (less common)
+      # - ./tests:/tests:ro
+    # You might want to add specific environment variables for development
+    # environment:
+    #   - PYTHONPATH=/config/custom_components
+    # Or override command to run specific tests
+    # command: ["python", "-m", "pytest", "/tests", "-v"]

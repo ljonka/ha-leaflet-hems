@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  homeassistant:
+    container_name: home_assistant
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HASSIO_VERSION: "2025.10.2"
+    volumes:
+      - hass_config:/config
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "8123:8123"
+    restart: unless-stopped
+    # On macOS, Docker runs in a VM which prevents both host networking from working properly
+    # AND prevents the container from reaching local network devices on the Mac's network.
+    # For development, consider running Home Assistant natively (see MACOS_DOCKER_NETWORKING.md)
+    # or configure your device at 192.168.178.42 to accept connections from Docker subnet (172.x.x.x)
+
+volumes:
+  hass_config:

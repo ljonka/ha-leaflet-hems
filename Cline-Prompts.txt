@@ -1,0 +1,72 @@
+1. Abschnitt: Grundgerüst
+
+Erstelle eine HomeAssistant Integration für das Consolinno Leaflet HEMS. 
+Das Leaflet HEMS (Heim Energie Management System) basiert auf dem nymea Framework. 
+Das Leaflet HEMS stellt alle nötigen Daten für die Energie-Ansichten in HomeAssistant bereit wie: 
+Energie -> Stromnetz -> Netzbezug, Netzeinspeisung, CO2-Emissionen des Netzes (steht aktuell noch nicht zur Verfügung beim Leaflet HEMS);
+PV-Module -> PV-Erzeugung;
+Heimspeicher -> Batteriesysteme;
+Gasverbrauch (Steht aktuell nicht zur Verfügung beim Leaflet HEMS));
+Wasserverbrauch (steht aktuell nicht zur Verfügung beim Leaflet HEMS)). 
+
+Das Leaflet HEMS ist mit allen Energie Anlagen Komponenten verbunden über unterschiedliche Protokolle, dazu gehören: Ladesäule, Wechselrichter, Batteriespeicher, Zähler am Netzanschluss, Wärmepumpe, generische Verbraucher.
+
+Verwende für die Nymea Verbindung ausschließlich eine lokale Verbindung über TCP/JSON-RPC mit TLS, selbstsigniert, mit auth auf PORT 2222. 
+
+* Erstelle das Grundgerüst für eine HomeAssistant Integration
+* Erstelle eine Testumgebung um die HomeAssistant Entwicklungsbegleitend zu testen und die Zwischenschritte immer wieder zu verifizieren
+* Teste das Grundgerüst
+* Erstelle einen mDNS Scanner, welcher automatisch Nymea Installationen mit Port 2222 tcp/json-rpc+tls im Netzwerk erkennt und in HomeAssistant anbietet als Gerät "Leaflet HEMS"
+* Prüfe den Port 2222 auf eine Funktionierende Nymea Instanz indem eine Hello Nachricht geschickt wird
+
+The initial handshake
+Every new connection is required to send the initial handshake message to nymea. The handshake message looks like this:
+
+{
+    "id": 0,
+    "method": "JSONRPC.Hello",
+    "params": {
+        "locale": "de_DE"
+    }
+}
+As any other message, also the handshake message is required to have an id. The method for the handshake is JSONRPC.Hello. Additionally, params might be included to configure the connection parameters for this connection. At this point, only the locale parameter is supported which will cause nymea:core to translate strings to be displayed to the user into the given langauge.
+
+nymea:core will reply with this message:
+
+{
+    "id":0,
+    "params": {
+        "authenticationRequired":false,
+        "initialSetupRequired":false,
+        "locale":"de_DE",
+        "name":"nymea Pi4",
+        "protocol version":"4.1",
+        "pushButtonAuthAvailable":false,
+        "server":"nymea",
+        "uuid":"{8c566f13-d231-420e-b6cf-e3e810d0cc42}",
+        "version":"0.18.1+202001232205~buster+rpi1"
+    },
+    "status":"success"
+}
+As specified in the basic message protocol, the response will contain the same id as the Hello request. Given a valid request, the status parameter contains success and the Hello method response contains the following parameters:
+
+authenticationRequired indicates whether or not authentication is required for all further communication. If this field is set to true, any subsequent call must include a valid token in any call.
+initialSetupRequired indicates whether this nymea:core instance is being set up initially. If this field is set to true, the initial setup procedure by creating a new user needs to be performed.
+locale indicates the locale for this connections. If the Hello command requested a certain locale, this will reflect that request if possible. In case the request did not specify a locale, this will indicate what the default on the nymea:core system is set to.
+name indicates the user displayable name of this nymea:core instance.
+protocol version indicates the nymea JSON-RPC version of this nymea:core instance.
+pushButtonAuthAvailableindicates whether or not a push button flow is available for user authentication.
+server will always be set to nymea unless product branding dictates anything different.
+uuid contains the UUID of this nymea:core instance.
+version contains the build version of this instance.
+
+Quelle:
+https://nymea.io/documentation/developers/clients/json-rpc
+
+Beschreibe in einer README.md Datei die Integration, die Entitäten, die manuelle Installation auf einem Raspberry Pi basierten HomeAssistant System.
+
+Es gibt in diesem Netzwerk zwei Leaflet HEMS Geräte, du kannst die Aufgabe vollständig gegen diese beiden Geräte testen, da noch keine Zugangsdaten benötigt werden. Der Verbindungsaufbau mit Zugangsdaten und dem eigentlich Datenabruf erfolgt später.
+
+Hier gibt es eine ähnliche Integration welche bereits eine Verbindung zu Nymea herstellen Kann: https://github.com/bairnhard/nymea_hem
+
+Erstelle Tests und führe Ende-zu-Ende Tests in der Entwicklungsumgebung selber regelmäßig durch, so dass am Ende alle Anforderungen getestet und umgesetzt sind.
