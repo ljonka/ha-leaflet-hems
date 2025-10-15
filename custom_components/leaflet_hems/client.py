@@ -54,7 +54,6 @@ class NymeaClient:
         self._reader, self._writer = await asyncio.wait_for(
             asyncio.open_connection(host, port, ssl=ssl_context), timeout=timeout
         )
-        _LOGGER.info("NymeaClient connected to %s:%s", host, port)
 
     async def close(self) -> None:
         """Close the connection and stop all background tasks.
@@ -84,8 +83,8 @@ class NymeaClient:
                         pass
                 except Exception:
                     pass
-            except Exception as exc:  # pragma: no cover - defensive
-                _LOGGER.warning("Error closing nymea connection: %s", exc)
+            except Exception:
+                pass
         self._reader = None
         self._writer = None
 
@@ -190,7 +189,6 @@ class NymeaClient:
             raise RuntimeError("Not connected")
             
         self._reader_task = asyncio.create_task(self._reader_loop())
-        _LOGGER.info("NymeaClient reader loop started")
 
     async def stop_reader_loop(self) -> None:
         """Stop the background reader loop."""
@@ -201,7 +199,6 @@ class NymeaClient:
             except asyncio.CancelledError:
                 pass
             self._reader_task = None
-            _LOGGER.info("NymeaClient reader loop stopped")
 
     async def _reader_loop(self) -> None:
         """Background task to read incoming messages and dispatch them."""
@@ -219,12 +216,19 @@ class NymeaClient:
                     message = json.loads(text)
                     
                     # Check if this is a notification
-                    if "notification" in message or "method" in message:
+                    if "notification" in message or ("method" in message and "id" not in message):
                         # This is a notification - dispatch to callbacks
                         await self._dispatch_notification(message)
                     else:
-                        # This is a response - put in response queue
-                        await self._response_queue.put(message)
+                        # This is a response - check if we have a pending future for it
+                        msg_id = message.get("id")
+                        if msg_id is not None and msg_id in self._pending_responses:
+                            future = self._pending_responses.pop(msg_id)
+                            if not future.done():
+                                future.set_result(message)
+                        else:
+                            # Fallback: put in response queue for legacy compatibility
+                            await self._response_queue.put(message)
                         
                 except json.JSONDecodeError as e:
                     _LOGGER.warning("Invalid JSON received: %s", e)
@@ -232,9 +236,17 @@ class NymeaClient:
                     _LOGGER.warning("Error in reader loop: %s", e)
                     break
         except asyncio.CancelledError:
-            _LOGGER.info("Reader loop cancelled")
+            # Cancel all pending responses
+            for future in self._pending_responses.values():
+                if not future.done():
+                    future.cancel()
+            self._pending_responses.clear()
         except Exception as e:
-            _LOGGER.error("Reader loop error: %s", e)
+            # Mark all pending responses as failed
+            for future in self._pending_responses.values():
+                if not future.done():
+                    future.set_exception(e)
+            self._pending_responses.clear()
 
     async def _dispatch_notification(self, notification: Dict[str, Any]) -> None:
         """Dispatch a notification to all registered callbacks."""
@@ -242,7 +254,7 @@ class NymeaClient:
             try:
                 callback(notification)
             except Exception as e:
-                _LOGGER.warning("Error in notification callback %s: %s", token, e)
+                pass
 
     async def start_keepalive(self, interval: float = 30.0) -> None:
         """Start sending periodic keepalive messages."""
@@ -250,7 +262,6 @@ class NymeaClient:
             return
             
         self._keepalive_task = asyncio.create_task(self._keepalive_loop(interval))
-        _LOGGER.info("NymeaClient keepalive started with interval %.1fs", interval)
 
     async def stop_keepalive(self) -> None:
         """Stop sending keepalive messages."""
@@ -261,7 +272,6 @@ class NymeaClient:
             except asyncio.CancelledError:
                 pass
             self._keepalive_task = None
-            _LOGGER.info("NymeaClient keepalive stopped")
 
     async def _keepalive_loop(self, interval: float) -> None:
         """Background task to send periodic keepalive messages."""
@@ -273,12 +283,15 @@ class NymeaClient:
                     self._next_id += 1
                     await self.send_request(payload)
                 except Exception as e:
-                    _LOGGER.warning("Keepalive send failed: %s", e)
+                    pass
         except asyncio.CancelledError:
-            _LOGGER.info("Keepalive loop cancelled")
+            pass
 
     async def send_request_with_response(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Dict[str, Any]:
         """Send a request and wait for the response, compatible with reader loop."""
+        if not self._writer or not self._reader:
+            raise RuntimeError("Not connected")
+            
         request_id = self._next_id
         self._next_id += 1
         
@@ -286,21 +299,19 @@ class NymeaClient:
         if params:
             payload["params"] = params
             
-        await self.send_request(payload)
+        # Create a future for this specific request
+        response_future = asyncio.Future()
+        self._pending_responses[request_id] = response_future
         
-        # Wait for response with matching ID
-        start_time = asyncio.get_event_loop().time()
-        while True:
-            try:
-                response = await asyncio.wait_for(self._response_queue.get(), timeout=1.0)
-                if response.get("id") == request_id:
-                    return response
-                else:
-                    # Put back non-matching response
-                    await self._response_queue.put(response)
-            except asyncio.TimeoutError:
-                pass
-                
-            elapsed = asyncio.get_event_loop().time() - start_time
-            if elapsed >= timeout:
-                raise asyncio.TimeoutError(f"Timeout waiting for response to {method}")
+        try:
+            await self.send_request(payload)
+            
+            # Wait for the specific response
+            response = await asyncio.wait_for(response_future, timeout=timeout)
+            return response
+            
+        except asyncio.TimeoutError:
+            raise asyncio.TimeoutError(f"Timeout waiting for response to {method}")
+        finally:
+            # Clean up pending response
+            self._pending_responses.pop(request_id, None)

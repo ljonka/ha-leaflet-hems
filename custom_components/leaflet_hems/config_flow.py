@@ -387,7 +387,6 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             message = json.dumps(auth_payload) + "\n"
 
             _LOGGER.info("Attempting authentication for user '%s' with %s:%s", username, host, port)
-            _LOGGER.info("Attempting authentication for user '%s' with %s:%s", username, host, port)
 
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port, ssl=ssl_context), timeout=10
@@ -436,16 +435,16 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                         def _on_wait_closed(t: asyncio.Task) -> None:
                             try:
                                 _ = t.result()
-                            except Exception as exc:
-                                _LOGGER.debug("wait_closed raised: %s", exc)
+                            except Exception:
+                                pass
                         try:
                             task.add_done_callback(_on_wait_closed)
                         except Exception:
                             pass
                     except Exception:
                         pass
-                except Exception as e:
-                    _LOGGER.debug("Error closing connection: %s", e)
+                except Exception:
+                    pass
         return None
 
     @callback

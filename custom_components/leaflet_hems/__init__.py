@@ -26,6 +26,10 @@ from .client import NymeaClient
 
 _LOGGER = logging.getLogger(__name__)
 
+# Create a quieter logger for the coordinator to avoid "Manually updated" debug messages
+_COORDINATOR_LOGGER = logging.getLogger(f"{__name__}.coordinator")
+_COORDINATOR_LOGGER.setLevel(logging.WARNING)
+
 PLATFORMS = ["sensor"]  # We will add more platforms later
 
 
@@ -35,7 +39,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     This creates a persistent NymeaClient and stores it in hass.data[DOMAIN][entry_id]
     so other parts of the integration can reuse the same TCP+TLS connection.
     """
-    _LOGGER.info("Setting up Leaflet HEMS integration for %s", entry.title)
 
     host = entry.data.get(CONF_HOST)
     port = entry.data.get(CONF_PORT)
@@ -44,7 +47,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     token = entry.data.get(CONF_NYMEA_TOKEN)
 
     if not host or not nymea_uuid:
-        _LOGGER.error("Missing host or nymea_uuid in config entry")
         return False
 
     # Ensure hass.data structure
@@ -72,29 +74,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await nymea_client.start_reader_loop()
         
         # Skip introspection to avoid buffer overflow issues
-        # Just enable notifications directly for Energy namespace
+        # Enable notifications for Energy and Integrations namespaces
         try:
             notify_response = await nymea_client.send_request_with_response(
                 "JSONRPC.SetNotificationStatus", 
-                {"namespaces": ["Energy"]},
+                {"namespaces": ["Energy", "Integrations"]},
                 timeout=5.0
             )
             if notify_response.get("status") == "success":
                 notifications_enabled = True
-                _LOGGER.info("Energy notifications enabled successfully")
-            else:
-                _LOGGER.warning("Failed to enable notifications: %s", notify_response.get("error"))
-        except Exception as e:
-            _LOGGER.warning("Error enabling notifications: %s", e)
+        except Exception:
+            pass
             
-    except Exception as exc:
-        _LOGGER.warning("Couldn't establish persistent connection to %s:%s: %s", host, port, exc)
+    except Exception:
         # Still continue — some setups may not need a persistent connection immediately
         # Return False if you prefer to abort setup on connection failure.
         # For now we proceed and store the client (maybe disconnected) so platforms can try later.
+        pass
 
     # Create coordinator for managing data updates
     coordinator = LeafletHEMSCoordinator(hass, nymea_client, nymea_name)
+    # Start coordinator background tasks (monitor root meter)
+    await coordinator.async_start()
     
     # Store the client, coordinator and token in hass.data for reuse
     hass.data[DOMAIN][entry.entry_id] = {
@@ -114,15 +115,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         try:
             token_cb = nymea_client.register_notification_callback(coordinator._handle_notification)
             hass.data[DOMAIN][entry.entry_id]["notification_token"] = token_cb
-        except Exception as e:
-            _LOGGER.warning("Failed to register notification callback: %s", e)
+        except Exception:
+            pass
 
 
     # Forward entry setups to platforms (sensor)
     try:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    except Exception as exc:
-        _LOGGER.warning("Failed to forward entry setups for %s: %s", entry.entry_id, exc)
+    except Exception:
+        pass
 
     # Add device to device registry
     device_registry = dr.async_get(hass)
@@ -135,13 +136,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         sw_version=VERSION,
     )
 
-    _LOGGER.info("Leaflet HEMS integration for %s setup complete", entry.title)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry and close the persistent NymeaClient."""
-    _LOGGER.info("Unloading Leaflet HEMS integration for %s", entry.title)
 
     entry_data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if entry_data:
@@ -151,14 +150,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if token and client:
             try:
                 client.unregister_notification_callback(token)
-            except Exception as exc:
-                _LOGGER.warning("Failed to unregister notification callback for %s: %s", entry.title, exc)
+            except Exception:
+                pass
 
         if client:
             try:
                 await client.close()
-            except Exception as exc:
-                _LOGGER.warning("Error closing NymeaClient for %s: %s", entry.title, exc)
+            except Exception:
+                pass
 
     # If you have platforms to unload, do that here (currently none)
     # unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
@@ -174,7 +173,7 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         """Initialize coordinator."""
         super().__init__(
             hass,
-            _LOGGER,
+            _COORDINATOR_LOGGER,
             name=f"{NAME} {nymea_name}",
             update_interval=None,
         )
@@ -184,37 +183,340 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         # Keys from sensor definitions that we care about for notifications
         self._keys = {s["key"] for s in POWER_BALANCE_SENSORS}
         self._data: Dict[str, Any] = {}
+        # Root meter tracking
+        self._root_meter_thing_id: Optional[str] = None
+        self._root_meter_thing_class_id: Optional[str] = None
+        self._root_meter_notification_token: Optional[str] = None
+        self._root_meter_state_keys = {"totalEnergyConsumed", "totalEnergyProduced"}
+        self._root_meter_state_types: Dict[str, str] = {}  # state_type_id -> state_name mapping
+
+    async def async_start(self) -> None:
+        """Start background tasks: query root meter and subscribe to its changes."""
+        await self._update_root_meter()
+        
+        # Force an initial data update to populate values
+        try:
+            initial_data = await self._async_update_data()
+            if initial_data:
+                self.async_set_updated_data(initial_data)
+        except Exception:
+            pass
+
+    async def _update_root_meter(self) -> None:
+        """Query Energy.GetRootMeter and subscribe/unsubscribe to its states."""
+        new_root_id = None
+        
+        # Retry logic with exponential backoff
+        max_retries = 3
+        base_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                timeout = 15.0 + (attempt * 5.0)  # Increase timeout with each retry
+                response = await self.client.send_request_with_response("Energy.GetRootMeter", timeout=timeout)
+                
+                if response.get("status") == "success":
+                    params = response.get("params", {})
+                    # Try both possible key formats for rootMeterThingId
+                    new_root_id = params.get("o:rootMeterThingId") or params.get("rootMeterThingId")
+                    break  # Success, exit retry loop
+                else:
+                    # Don't retry on non-success responses from the server
+                    break
+                    
+            except asyncio.TimeoutError:
+                delay = base_delay * (2 ** attempt)  # Exponential backoff
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay)
+                    
+            except Exception:
+                # For non-timeout exceptions, don't retry immediately
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+
+        if new_root_id == self._root_meter_thing_id:
+            return  # No change
+
+        # Unsubscribe from previous root meter states
+        if self._root_meter_notification_token:
+            self.client.unregister_notification_callback(self._root_meter_notification_token)
+            self._root_meter_notification_token = None
+
+        self._root_meter_thing_id = new_root_id
+
+        if new_root_id:
+            # Subscribe to state changes for the new root meter
+            self._root_meter_notification_token = self.client.register_notification_callback(
+                self._handle_root_meter_notification
+            )
+            
+            # Fetch root meter thing class ID and state types
+            await self._fetch_root_meter_state_types()
+            
+            # Fetch initial root meter state values
+            await self._fetch_root_meter_states()
+        else:
+            # Clear cached data when no root meter
+            self._root_meter_thing_class_id = None
+            self._root_meter_state_types.clear()
+
+    async def _fetch_root_meter_state_types(self) -> None:
+        """Fetch state types for the root meter thing to enable state type ID to name mapping."""
+        if not self._root_meter_thing_id:
+            return
+            
+        try:
+            # First, try to get all things to find the root meter thing and its class ID
+            things_response = await self.client.send_request_with_response(
+                "Integrations.GetThings",
+                {},
+                timeout=10.0
+            )
+            
+            if things_response.get("status") == "success" and things_response.get("params", {}).get("things"):
+                things = things_response["params"]["things"]
+                
+                # Find our root meter thing to get its thingClassId
+                root_meter_thing_class_id = None
+                for thing in things:
+                    if thing.get("id") == self._root_meter_thing_id:
+                        root_meter_thing_class_id = thing.get("thingClassId")
+                        break
+                
+                if not root_meter_thing_class_id:
+                    return
+                    
+                self._root_meter_thing_class_id = root_meter_thing_class_id
+                
+                # Now get the state types for this thing class
+                state_types_response = await self.client.send_request_with_response(
+                    "Integrations.GetStateTypes",
+                    {"thingClassId": root_meter_thing_class_id},
+                    timeout=10.0
+                )
+                
+                if state_types_response.get("status") == "success" and state_types_response.get("params", {}).get("stateTypes"):
+                    state_types = state_types_response["params"]["stateTypes"]
+                    
+                    # Build mapping of state type ID to state name
+                    self._root_meter_state_types.clear()
+                    for state_type in state_types:
+                        # Use the 'r:id' field as the state type ID and 'name' as the state name
+                        state_type_id = state_type.get("r:id") or state_type.get("id")
+                        state_name = state_type.get("name")
+                        if state_type_id and state_name:
+                            self._root_meter_state_types[state_type_id] = state_name
+                
+        except Exception:
+            pass
+
+    async def _fetch_specific_root_meter_state(self, thing_id: str, state_type_id: str, new_value: Any) -> None:
+        """Fetch a specific root meter state to get its name and update data accordingly."""
+        try:
+            # Get the specific state value to determine its name
+            response = await self.client.send_request_with_response(
+                "Integrations.GetStateValue",
+                {"thingId": thing_id, "stateTypeId": state_type_id},
+                timeout=5.0
+            )
+            
+            if response.get("status") == "success" and response.get("params"):
+                # For now, we'll trigger a full state refresh to get all state names
+                # This is similar to the C++ approach where we have the stateType and can check its name
+                await self._fetch_root_meter_states()
+                
+        except Exception:
+            pass
+
+    async def _fetch_root_meter_states(self) -> None:
+        """Fetch current state values for the root meter."""
+        if not self._root_meter_thing_id:
+            return
+            
+        try:
+            # Fetch states for the root meter using the correct API
+            response = await self.client.send_request_with_response(
+                "Integrations.GetStateValues", 
+                {"thingId": self._root_meter_thing_id},
+                timeout=10.0
+            )
+            
+            if response.get("status") == "success" and response.get("params", {}).get("values"):
+                values = response["params"]["values"]
+                new_data = dict(self.data or {})
+                updated = False
+                
+                # Map root meter states to power balance keys using state type IDs
+                for state in values:
+                    state_type_id = state.get("stateTypeId")
+                    value = state.get("value")
+                    
+                    if state_type_id and value is not None:
+                        # Use state type mapping to get state name
+                        state_name = self._root_meter_state_types.get(state_type_id)
+                        
+                        if state_name == "totalEnergyConsumed":
+                            new_data["totalAcquisition"] = value
+                            updated = True
+                        elif state_name == "totalEnergyProduced":
+                            new_data["totalReturn"] = value
+                            updated = True
+                
+                if updated:
+                    self.async_set_updated_data(new_data)
+                
+        except Exception:
+            pass
+
+    @callback
+    def _handle_root_meter_notification(self, notification: Dict[str, Any]) -> None:
+        """Handle state change notifications for the root meter."""
+        method = notification.get("method") or notification.get("notification")
+        if not method or "Integrations.StateChanged" not in method:
+            return
+        
+        params = notification.get("params", {})
+        thing_id = params.get("thingId")
+        
+        if thing_id != self._root_meter_thing_id:
+            return
+            
+        # Get state type ID to determine if this is a root meter state we care about
+        state_type_id = params.get("stateTypeId")
+        value = params.get("value")
+        
+        if value is None:
+            return
+            
+        # Use state type mapping to get state name if available
+        state_name = self._root_meter_state_types.get(state_type_id)
+        
+        if state_name:
+            # Handle real-time updates for states we care about
+            if state_name in self._root_meter_state_keys:
+                new_data = dict(self.data or {})
+                updated = False
+                
+                if state_name == "totalEnergyConsumed":
+                    old_value = new_data.get("totalAcquisition")
+                    if old_value != value:
+                        new_data["totalAcquisition"] = value
+                        updated = True
+                elif state_name == "totalEnergyProduced":
+                    old_value = new_data.get("totalReturn")
+                    if old_value != value:
+                        new_data["totalReturn"] = value
+                        updated = True
+                
+                if updated:
+                    self.async_set_updated_data(new_data)
+        else:
+            # Fallback: if we don't have state type mapping, fetch the specific state to get its name
+            self.hass.async_create_task(self._fetch_specific_root_meter_state(thing_id, state_type_id, value))
 
     async def _async_update_data(self):
         """Fetch data from Leaflet HEMS (used for initial fetch/fallback)."""
+        data = {}
+        
+        # First, try to get power balance data (excluding totalAcquisition/totalReturn)
         try:
             response = await self.client.send_request_with_response("Energy.GetPowerBalance", timeout=10.0)
             
             if response.get("status") == "success" and response.get("params"):
-                return response["params"]
-            else:
-                _LOGGER.warning("Energy.GetPowerBalance failed: %s", response.get("error"))
-                return {}
+                power_balance_data = response["params"]
                 
-        except Exception as e:
-            _LOGGER.error("Error fetching power balance data: %s", e)
-            raise
+                # Only include non-root-meter data from power balance
+                for key in power_balance_data:
+                    if key not in ["totalAcquisition", "totalReturn"]:
+                        data[key] = power_balance_data[key]
+                
+        except Exception:
+            pass
+        
+        # Always get totalAcquisition and totalReturn from root meter if available
+        if self._root_meter_thing_id:
+            # Ensure state type mapping is available
+            if not self._root_meter_state_types:
+                await self._fetch_root_meter_state_types()
+            
+            try:
+                # Fetch root meter states using correct API
+                response = await self.client.send_request_with_response(
+                    "Integrations.GetStateValues", 
+                    {"thingId": self._root_meter_thing_id},
+                    timeout=10.0
+                )
+                
+                if response.get("status") == "success" and response.get("params", {}).get("values"):
+                    values = response["params"]["values"]
+                    
+                    # Map root meter states to power balance keys using state type IDs
+                    for state in values:
+                        state_type_id = state.get("stateTypeId")
+                        value = state.get("value")
+                        
+                        if state_type_id and value is not None:
+                            # Use state type mapping to get state name
+                            state_name = self._root_meter_state_types.get(state_type_id)
+                            
+                            if state_name == "totalEnergyConsumed":
+                                data["totalAcquisition"] = value
+                            elif state_name == "totalEnergyProduced":
+                                data["totalReturn"] = value
+                    
+            except Exception:
+                pass
+        
+        return data
 
     @callback
     def _handle_notification(self, notification: Dict[str, Any]) -> None:
         """Handle notifications from the Nymea client and push updates to the coordinator."""
         method = notification.get("method") or notification.get("notification")
-        if not method or ("Energy" not in method and "PowerBalance" not in method and "Power" not in method):
+        
+        if not method:
+            return
+            
+        # Handle root meter change notification
+        if method == "Energy.RootMeterChanged":
+            # Schedule root meter update in the event loop
+            self.hass.async_create_task(self._update_root_meter())
+            return
+            
+        # Handle root meter state changes
+        if method == "Integrations.StateChanged":
+            params = notification.get("params", {})
+            thing_id = params.get("thingId")
+            if thing_id and thing_id == self._root_meter_thing_id:
+                # Process the state change directly instead of fetching all states
+                self._handle_root_meter_notification(notification)
+                return
+            
+        if "Energy" not in method and "PowerBalance" not in method and "Power" not in method:
             return
 
         params = notification.get("params", {}) or notification
-        # Merge into existing coordinator data
+        
+        # Periodically check root meter status if we haven't found one yet
+        if not self._root_meter_thing_id and method == "Energy.PowerBalanceChanged":
+            self.hass.async_create_task(self._update_root_meter())
+        
+        # Merge into existing coordinator data - EXCLUDE totalAcquisition/totalReturn from PowerBalance notifications
         new_data = dict(self.data or {})
         changed = False
+        
         for k in self._keys:
             if k in params:
-                if new_data.get(k) != params[k]:
-                    new_data[k] = params[k]
+                # Skip totalAcquisition and totalReturn from PowerBalance notifications - these should only come from root meter
+                if k in ["totalAcquisition", "totalReturn"] and "PowerBalance" in method:
+                    continue
+                    
+                old_value = new_data.get(k)
+                new_value = params[k]
+                if old_value != new_value:
+                    new_data[k] = new_value
                     changed = True
+        
         if changed:
             self.async_set_updated_data(new_data)

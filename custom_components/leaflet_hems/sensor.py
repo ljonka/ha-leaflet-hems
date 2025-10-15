@@ -112,7 +112,6 @@ async def async_setup_entry(
         entities.append(entity)
 
     async_add_entities(entities, True)
-    _LOGGER.info("Added %d Leaflet HEMS sensor entities", len(entities))
 
 
 class LeafletPowerBalanceSensor(CoordinatorEntity, SensorEntity):
