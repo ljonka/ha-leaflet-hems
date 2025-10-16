@@ -23,3 +23,16 @@ NYMDA_RPC_VERSION = "4.1" # From nymea documentation
 RPC_HELLO_METHOD = "JSONRPC.Hello"
 RPC_HELLO_LOCALE = "de_DE"
 RPC_ID = 0
+
+# Discovery constants
+ZEROCONF_SERVICE_TYPE = "_jsonrpc._tcp.local."
+ZEROCONF_NYMEA_MANUFACTURER = "nymea GmbH"
+ZEROCONF_NAME_PATTERN = "nymea"
+
+# Discovery TXT record keys
+TXT_UUID = "uuid"
+TXT_NAME = "name"
+TXT_MANUFACTURER = "manufacturer"
+TXT_SERVER_VERSION = "serverVersion"
+TXT_SSL_ENABLED = "sslEnabled"
+TXT_JSONRPC_VERSION = "jsonrpcVersion"

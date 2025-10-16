@@ -10,5 +10,11 @@
   "issue_tracker": "https://github.com/ljonka/ha-leaflet-hems/issues",
   "requirements": ["zeroconf", "aiohttp", "cryptography"],
   "version": "0.1.0",
-  "homeassistant": "2025.10.2"
+  "homeassistant": "2025.10.2",
+  "zeroconf": [
+    {
+      "type": "_jsonrpc._tcp.local.",
+      "name": "*nymea*"
+    }
+  ]
 }

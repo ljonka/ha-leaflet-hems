@@ -8,9 +8,10 @@ This integration connects Home Assistant to Consolinno Leaflet HEMS (Heim Energi
 
 ## Features
 
-- **Automatic Discovery**: Scans your local network using mDNS to find Leaflet HEMS devices.
+- **Automatic Discovery**: Uses mDNS/Zeroconf to automatically discover Leaflet HEMS devices on your network via the `_jsonrpc._tcp.local.` service type.
 - **Manual Setup**: Allows manual configuration of devices if automatic discovery fails.
 - **Secure Connection**: Connects to the nymea device using TLS/JSON-RPC on port 2222.
+- **Device Validation**: Validates discovered devices to ensure they are genuine nymea-based Leaflet HEMS devices.
 - **Device Information**: Displays device name, UUID, and version.
 - **Future Data Entities**: (Planned) Entities for:
     - Energy -> Stromnetz (Grid): Netzbezug (Grid Consumption), Netzeinspeisung (Feed-in), CO2-Emissionen (CO2 Emissions - when available).

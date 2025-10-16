@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "manual": {
+        "title": "Manual Setup",
+        "description": "Enter the connection details for your Leaflet HEMS device",
+        "data": {
+          "host": "Host/IP Address",
+          "port": "Port",
+          "name": "Device Name (optional)",
+          "username": "Username (optional)",
+          "password": "Password (optional)"
+        }
+      },
+      "discovery_confirm": {
+        "title": "Discovered Leaflet HEMS Device",
+        "description": "A Leaflet HEMS device was discovered on your network:\n\n**Name:** {name}\n**Host:** {host}:{port}\n**UUID:** {uuid}\n\nDo you want to add this device?",
+        "data": {}
+      },
+      "auth": {
+        "title": "Authentication Required",
+        "description": "Enter your credentials for {name} ({host})",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the device. Please check the host and port.",
+      "invalid_auth": "Invalid username or password.",
+      "cannot_get_uuid": "Could not retrieve device UUID.",
+      "not_supported": "This device is not a supported Leaflet HEMS device.",
+      "discovery_error": "An error occurred during device discovery."
+    },
+    "abort": {
+      "already_configured": "Device is already configured",
+      "cannot_connect": "Cannot connect to device",
+      "cannot_get_uuid": "Cannot get device UUID",
+      "not_supported": "Device not supported",
+      "discovery_error": "Discovery error"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Leaflet HEMS Options",
+        "description": "Configure options for your Leaflet HEMS device",
+        "data": {}
+      }
+    }
+  }
+}

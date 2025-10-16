@@ -22,6 +22,12 @@ from .const import (
     RPC_ID,
     DOMAIN,
     CONF_NYMEA_TOKEN,
+    ZEROCONF_NYMEA_MANUFACTURER,
+    TXT_UUID,
+    TXT_NAME,
+    TXT_MANUFACTURER,
+    TXT_SERVER_VERSION,
+    TXT_SSL_ENABLED,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -43,6 +49,8 @@ AUTH_SCHEMA = vol.Schema(
         vol.Required("password"): cv.string,
     }
 )
+
+DISCOVERY_CONFIRM_SCHEMA = vol.Schema({})
 
 
 @config_entries.HANDLERS.register(DOMAIN)
@@ -174,6 +182,85 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders=user_input or {},
         )
 
+    async def async_step_zeroconf(self, discovery_info):
+        """Handle zeroconf discovery."""
+        _LOGGER.info("Zeroconf discovery received: %s", discovery_info)
+        
+        # Parse discovery information
+        parsed_info = self._parse_discovery_info(discovery_info)
+        if not parsed_info:
+            _LOGGER.warning("Failed to parse discovery info or device not supported")
+            return self.async_abort(reason="not_supported")
+
+        # Extract device information
+        host = parsed_info[CONF_HOST]
+        port = parsed_info[CONF_PORT]
+        uuid = parsed_info[CONF_NYMEA_UUID]
+        name = parsed_info[CONF_NYMEA_NAME]
+
+        # Set unique_id and check if already configured
+        await self.async_set_unique_id(uuid)
+        self._abort_if_unique_id_configured()
+
+        # Store discovery info for potential use in subsequent steps
+        self._discovery_info = parsed_info
+
+        # Perform handshake to validate the device and get additional info
+        handshake_data = await self._async_perform_handshake(host, port)
+        if not handshake_data:
+            _LOGGER.warning("Could not connect to discovered device %s:%s", host, port)
+            return self.async_abort(reason="cannot_connect")
+
+        # Update discovery info with handshake data
+        self._discovery_info.update({
+            CONF_NYMEA_UUID: handshake_data.get("uuid", uuid),
+            CONF_NYMEA_NAME: handshake_data.get("name", name),
+        })
+
+        # Show confirmation form to user
+        return await self.async_step_discovery_confirm()
+
+    async def async_step_discovery_confirm(self, user_input: Optional[Dict[str, Any]] = None):
+        """Handle discovery confirmation."""
+        if not self._discovery_info:
+            return self.async_abort(reason="discovery_error")
+
+        if user_input is not None:
+            # User confirmed - check if authentication is needed
+            handshake_data = await self._async_perform_handshake(
+                self._discovery_info[CONF_HOST], 
+                self._discovery_info[CONF_PORT]
+            )
+            
+            if handshake_data and handshake_data.get("authentication_required"):
+                # Authentication required - go to auth step
+                return self.async_show_form(
+                    step_id="auth",
+                    data_schema=AUTH_SCHEMA,
+                    description_placeholders={
+                        "host": self._discovery_info[CONF_HOST],
+                        "name": self._discovery_info[CONF_NYMEA_NAME],
+                    },
+                )
+            else:
+                # No authentication required - create entry directly
+                return self.async_create_entry(
+                    title=self._discovery_info[CONF_NYMEA_NAME],
+                    data=self._discovery_info,
+                )
+
+        # Show confirmation form
+        return self.async_show_form(
+            step_id="discovery_confirm",
+            data_schema=DISCOVERY_CONFIRM_SCHEMA,
+            description_placeholders={
+                "name": self._discovery_info[CONF_NYMEA_NAME],
+                "host": self._discovery_info[CONF_HOST],
+                "port": self._discovery_info[CONF_PORT],
+                "uuid": self._discovery_info[CONF_NYMEA_UUID],
+            },
+        )
+
     async def async_step_auth(self, user_input: Optional[Dict[str, Any]] = None):
         """Handle authentication step."""
         errors = {}
@@ -196,18 +283,19 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             password = user_input.get("password", "")
 
             # Try to authenticate with provided credentials using stored host/port
-            auth_success = await self._async_perform_authentication(
+            auth_token = await self._async_perform_authentication(
                 host,
                 port,
                 username,
                 password,
             )
 
-            if auth_success:
+            if auth_token:
+                # Store the token in discovery info
+                self._discovery_info[CONF_NYMEA_TOKEN] = auth_token
                 await self.async_set_unique_id(self._discovery_info[CONF_NYMEA_UUID])
                 self._abort_if_unique_id_configured()
                 # Authentication succeeded — create the config entry immediately
-                # (skip performing another handshake to avoid extra delay)
                 return self.async_create_entry(
                     title=self._discovery_info[CONF_NYMEA_NAME],
                     data=self._discovery_info,
@@ -342,8 +430,15 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                         def _on_wait_closed(t: asyncio.Task) -> None:
                             try:
                                 _ = t.result()
+                            except asyncio.TimeoutError:
+                                # SSL shutdown timeouts are common and not critical
+                                _LOGGER.debug("SSL shutdown timed out during connection cleanup")
                             except Exception as exc:
-                                _LOGGER.warning("wait_closed raised: %s", exc)
+                                # Only log other exceptions as warnings
+                                if "SSL shutdown timed out" not in str(exc):
+                                    _LOGGER.warning("wait_closed raised: %s", exc)
+                                else:
+                                    _LOGGER.debug("SSL shutdown timeout: %s", exc)
                         try:
                             task.add_done_callback(_on_wait_closed)
                         except Exception:
@@ -358,94 +453,99 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     async def _async_perform_authentication(self, host: str, port: int, username: str, password: str) -> Optional[str]:
         """Perform authentication with the Nymea device and return token on success.
 
-        Tries the JSONRPC.Authenticate method first (used by nymea examples). If the
-        response indicates an error, this will return None. The function returns the
-        token string on success, otherwise None.
+        Uses the same approach as the working manual authentication: creates a NymeaClient
+        connection, performs the required handshake, then authenticates using JSONRPC.Authenticate.
         """
-        import ssl
-        import json
-
-        reader = None
-        writer = None
-
+        nymea = NymeaClient()
         try:
-            loop = asyncio.get_event_loop()
-            ssl_context = await loop.run_in_executor(
-                None, lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            )
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-
-            # Prepare authentication payload (nymea expects a deviceName parameter as well)
-            device_name = f"HomeAssistant-{host}"
-            auth_payload = {
-                "id": 1,
-                "method": "JSONRPC.Authenticate",
-                "params": {"username": username, "password": password, "deviceName": device_name},
-            }
-
-            message = json.dumps(auth_payload) + "\n"
-
             _LOGGER.info("Attempting authentication for user '%s' with %s:%s", username, host, port)
-
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port, ssl=ssl_context), timeout=10
-            )
-
-            writer.write(message.encode("utf-8"))
-            await writer.drain()
-
-            response_line = await asyncio.wait_for(reader.readline(), timeout=10)
-            response_text = response_line.decode("utf-8").strip()
-
-            result = json.loads(response_text)
-
-            if result.get("status") == "success":
-                params = result.get("params") or {}
-                token = params.get("token")
-                if token:
-                    _LOGGER.info("Authentication successful for user '%s' (token received)", username)
-                    return token
-                _LOGGER.warning("Authentication returned success but no token for user '%s'", username)
+            
+            # Connect to the device
+            await nymea.connect(host, port)
+            
+            # Perform required handshake first (nymea protocol requirement)
+            hello_params = await nymea.hello(RPC_HELLO_LOCALE)
+            if not hello_params:
+                _LOGGER.warning("Handshake failed during authentication for %s:%s", host, port)
                 return None
-
-            # Non-success response: log and return None
-            err = result.get("error")
-            if isinstance(err, dict):
-                err_msg = err.get("message") or str(err)
+            
+            # Perform authentication using correct method
+            device_name = f"HomeAssistant-{host}"
+            token = await nymea.authenticate(username, password, device_name)
+            
+            if token:
+                _LOGGER.info("Authentication successful for user '%s' (token received)", username)
+                return token
             else:
-                err_msg = str(err)
-            _LOGGER.warning("Authentication failed for user '%s': %s", username, err_msg or "Unknown error")
-            return None
-
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Authentication timeout for user '%s' with %s:%s", username, host, port)
-        except json.JSONDecodeError as e:
-            _LOGGER.error("Failed to parse authentication response from %s:%s: %s", host, port, e)
-        except ssl.SSLError as e:
-            _LOGGER.error("SSL error during authentication with %s:%s: %s", host, port, e)
+                _LOGGER.warning("Authentication failed for user '%s'", username)
+                return None
+                
         except Exception as e:
             _LOGGER.error("Unexpected error during authentication with %s:%s: %s", host, port, e, exc_info=True)
+            return None
         finally:
-            if writer:
-                try:
-                    writer.close()
-                    try:
-                        task = asyncio.create_task(writer.wait_closed())
-                        def _on_wait_closed(t: asyncio.Task) -> None:
-                            try:
-                                _ = t.result()
-                            except Exception:
-                                pass
-                        try:
-                            task.add_done_callback(_on_wait_closed)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-        return None
+            # Clean up connection
+            try:
+                await nymea.close()
+            except Exception:
+                pass
+
+    def _parse_discovery_info(self, discovery_info) -> Optional[Dict[str, Any]]:
+        """Parse zeroconf discovery information."""
+        try:
+            # Extract host and port from discovery info
+            host = discovery_info.host
+            port = discovery_info.port
+            
+            # Get TXT record properties
+            properties = discovery_info.properties or {}
+            
+            def _decode_property(key: str) -> str:
+                """Safely decode a property that might be bytes or str."""
+                value = properties.get(key, "")
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="ignore")
+                return str(value) if value else ""
+            
+            # Validate that this is a nymea device
+            manufacturer = _decode_property(TXT_MANUFACTURER)
+            if manufacturer != ZEROCONF_NYMEA_MANUFACTURER:
+                _LOGGER.info("Device manufacturer '%s' is not '%s', skipping", manufacturer, ZEROCONF_NYMEA_MANUFACTURER)
+                return None
+            
+            # Extract device information from TXT records
+            uuid = _decode_property(TXT_UUID)
+            name = _decode_property(TXT_NAME)
+            server_version = _decode_property(TXT_SERVER_VERSION)
+            ssl_enabled = _decode_property(TXT_SSL_ENABLED)
+            
+            # Clean up UUID (remove braces if present)
+            if uuid.startswith("{") and uuid.endswith("}"):
+                uuid = uuid[1:-1]
+            
+            # Use fallback values if needed
+            if not uuid:
+                _LOGGER.warning("No UUID found in discovery info")
+                return None
+                
+            if not name:
+                name = f"Leaflet HEMS ({host})"
+            
+            _LOGGER.info(
+                "Parsed discovery info - Host: %s, Port: %s, Name: %s, UUID: %s, Version: %s, SSL: %s",
+                host, port, name, uuid, server_version, ssl_enabled
+            )
+            
+            return {
+                CONF_HOST: host,
+                CONF_PORT: port,
+                CONF_NYMEA_UUID: uuid,
+                CONF_NYMEA_NAME: name,
+            }
+            
+        except Exception as e:
+            _LOGGER.error("Error parsing discovery info: %s", e, exc_info=True)
+            return None
 
     @callback
     async def async_step_import(self, user_input: Dict[str, Any]) -> Dict[str, Any]:
