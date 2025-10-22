@@ -24,6 +24,22 @@ RPC_HELLO_METHOD = "JSONRPC.Hello"
 RPC_HELLO_LOCALE = "de_DE"
 RPC_ID = 0
 
+# HEMS API Methods
+HEMS_GET_BATTERY_CONFIGS = "Hems.GetBatteryConfigurations"
+HEMS_GET_PV_CONFIGS = "Hems.GetPvConfigurations"
+
+# HEMS Events
+HEMS_BATTERY_ADDED = "Hems.BatteryConfigurationAdded"
+HEMS_BATTERY_CHANGED = "Hems.BatteryConfigurationChanged"
+HEMS_BATTERY_REMOVED = "Hems.BatteryConfigurationRemoved"
+HEMS_PV_ADDED = "Hems.PvConfigurationAdded"
+HEMS_PV_CHANGED = "Hems.PvConfigurationChanged"
+HEMS_PV_REMOVED = "Hems.PvConfigurationRemoved"
+
+# Device Types
+DEVICE_TYPE_BATTERY = "battery"
+DEVICE_TYPE_INVERTER = "inverter"
+
 # Discovery constants
 ZEROCONF_SERVICE_TYPE = "_jsonrpc._tcp.local."
 ZEROCONF_NYMEA_MANUFACTURER = "nymea GmbH"

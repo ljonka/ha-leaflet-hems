@@ -21,6 +21,16 @@ from .const import (
     CONF_NYMEA_UUID,
     CONF_NYMEA_NAME,
     CONF_NYMEA_TOKEN,
+    HEMS_GET_BATTERY_CONFIGS,
+    HEMS_GET_PV_CONFIGS,
+    HEMS_BATTERY_ADDED,
+    HEMS_BATTERY_CHANGED,
+    HEMS_BATTERY_REMOVED,
+    HEMS_PV_ADDED,
+    HEMS_PV_CHANGED,
+    HEMS_PV_REMOVED,
+    DEVICE_TYPE_BATTERY,
+    DEVICE_TYPE_INVERTER,
 )
 from .client import NymeaClient
 
@@ -190,9 +200,22 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         self._root_meter_state_keys = {"totalEnergyConsumed", "totalEnergyProduced"}
         self._root_meter_state_types: Dict[str, str] = {}  # state_type_id -> state_name mapping
 
+        # Battery and inverter tracking
+        self._battery_configs: Dict[str, Dict[str, Any]] = {}  # battery_thing_id -> config
+        self._pv_configs: Dict[str, Dict[str, Any]] = {}  # pv_thing_id -> config
+        self._battery_states: Dict[str, Dict[str, Any]] = {}  # battery_thing_id -> states
+        self._pv_states: Dict[str, Dict[str, Any]] = {}  # pv_thing_id -> states
+        self._battery_state_types: Dict[str, Dict[str, str]] = {}  # battery_thing_id -> state_type_id -> state_name
+        self._pv_state_types: Dict[str, Dict[str, str]] = {}  # pv_thing_id -> state_type_id -> state_name
+        self._battery_notification_tokens: Dict[str, str] = {}  # battery_thing_id -> token
+        self._pv_notification_tokens: Dict[str, str] = {}  # pv_thing_id -> token
+        self._aggregated_data: Dict[str, float] = {}  # Aggregated values for groups
+
     async def async_start(self) -> None:
         """Start background tasks: query root meter and subscribe to its changes."""
         await self._update_root_meter()
+        await self._update_battery_configs()
+        await self._update_pv_configs()
         
         # Force an initial data update to populate values
         try:
@@ -520,3 +543,368 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         
         if changed:
             self.async_set_updated_data(new_data)
+
+    async def _update_battery_configs(self) -> None:
+        """Query Hems.GetBatteryConfigurations and subscribe to battery state changes."""
+        try:
+            response = await self.client.send_request_with_response(HEMS_GET_BATTERY_CONFIGS, timeout=10.0)
+            
+            if response.get("status") == "success" and response.get("params", {}).get("batteryConfigurations"):
+                battery_configs = response["params"]["batteryConfigurations"]
+                current_battery_ids = set(self._battery_configs.keys())
+                new_battery_ids = set()
+                
+                for config in battery_configs:
+                    battery_thing_id = config.get("batteryThingId")
+                    if battery_thing_id:
+                        new_battery_ids.add(battery_thing_id)
+                        if battery_thing_id not in self._battery_configs:
+                            # New battery configuration
+                            self._battery_configs[battery_thing_id] = config
+                            await self._fetch_battery_state_types(battery_thing_id)
+                            await self._subscribe_to_battery_states(battery_thing_id)
+                            await self._fetch_battery_states(battery_thing_id)
+                            _LOGGER.info("Added battery configuration: %s", battery_thing_id)
+                        else:
+                            # Update existing configuration if needed
+                            self._battery_configs[battery_thing_id] = config
+                
+                # Remove batteries that are no longer present
+                removed_battery_ids = current_battery_ids - new_battery_ids
+                for battery_id in removed_battery_ids:
+                    await self._unsubscribe_from_battery_states(battery_id)
+                    self._battery_configs.pop(battery_id, None)
+                    self._battery_states.pop(battery_id, None)
+                    self._battery_state_types.pop(battery_id, None)
+                    _LOGGER.info("Removed battery configuration: %s", battery_id)
+                
+                # Update aggregated data
+                await self._update_aggregated_data()
+                
+        except Exception as e:
+            _LOGGER.warning("Failed to fetch battery configurations: %s", e)
+
+    async def _update_pv_configs(self) -> None:
+        """Query Hems.GetPvConfigurations and subscribe to PV state changes."""
+        try:
+            response = await self.client.send_request_with_response(HEMS_GET_PV_CONFIGS, timeout=10.0)
+            
+            if response.get("status") == "success" and response.get("params", {}).get("pvConfigurations"):
+                pv_configs = response["params"]["pvConfigurations"]
+                current_pv_ids = set(self._pv_configs.keys())
+                new_pv_ids = set()
+                
+                for config in pv_configs:
+                    pv_thing_id = config.get("pvThingId")
+                    if pv_thing_id:
+                        new_pv_ids.add(pv_thing_id)
+                        if pv_thing_id not in self._pv_configs:
+                            # New PV configuration
+                            self._pv_configs[pv_thing_id] = config
+                            await self._fetch_pv_state_types(pv_thing_id)
+                            await self._subscribe_to_pv_states(pv_thing_id)
+                            await self._fetch_pv_states(pv_thing_id)
+                            _LOGGER.info("Added PV configuration: %s", pv_thing_id)
+                        else:
+                            # Update existing configuration if needed
+                            self._pv_configs[pv_thing_id] = config
+                
+                # Remove PVs that are no longer present
+                removed_pv_ids = current_pv_ids - new_pv_ids
+                for pv_id in removed_pv_ids:
+                    await self._unsubscribe_from_pv_states(pv_id)
+                    self._pv_configs.pop(pv_id, None)
+                    self._pv_states.pop(pv_id, None)
+                    self._pv_state_types.pop(pv_id, None)
+                    _LOGGER.info("Removed PV configuration: %s", pv_id)
+                
+                # Update aggregated data
+                await self._update_aggregated_data()
+                
+        except Exception as e:
+            _LOGGER.warning("Failed to fetch PV configurations: %s", e)
+
+    async def _fetch_battery_state_types(self, battery_thing_id: str) -> None:
+        """Fetch state types for a battery thing."""
+        try:
+            # Get the battery thing to find its class ID
+            things_response = await self.client.send_request_with_response(
+                "Integrations.GetThings",
+                {},
+                timeout=10.0
+            )
+            
+            if things_response.get("status") == "success" and things_response.get("params", {}).get("things"):
+                things = things_response["params"]["things"]
+                
+                # Find our battery thing to get its thingClassId
+                battery_thing_class_id = None
+                for thing in things:
+                    if thing.get("id") == battery_thing_id:
+                        battery_thing_class_id = thing.get("thingClassId")
+                        break
+                
+                if not battery_thing_class_id:
+                    return
+                
+                # Get state types for this battery thing class
+                state_types_response = await self.client.send_request_with_response(
+                    "Integrations.GetStateTypes",
+                    {"thingClassId": battery_thing_class_id},
+                    timeout=10.0
+                )
+                
+                if state_types_response.get("status") == "success" and state_types_response.get("params", {}).get("stateTypes"):
+                    state_types = state_types_response["params"]["stateTypes"]
+                    
+                    # Build mapping of state type ID to state name
+                    self._battery_state_types[battery_thing_id] = {}
+                    for state_type in state_types:
+                        state_type_id = state_type.get("r:id") or state_type.get("id")
+                        state_name = state_type.get("name")
+                        if state_type_id and state_name:
+                            self._battery_state_types[battery_thing_id][state_type_id] = state_name
+                
+        except Exception as e:
+            _LOGGER.warning("Failed to fetch battery state types for %s: %s", battery_thing_id, e)
+
+    async def _fetch_pv_state_types(self, pv_thing_id: str) -> None:
+        """Fetch state types for a PV thing."""
+        try:
+            # Get the PV thing to find its class ID
+            things_response = await self.client.send_request_with_response(
+                "Integrations.GetThings",
+                {},
+                timeout=10.0
+            )
+            
+            if things_response.get("status") == "success" and things_response.get("params", {}).get("things"):
+                things = things_response["params"]["things"]
+                
+                # Find our PV thing to get its thingClassId
+                pv_thing_class_id = None
+                for thing in things:
+                    if thing.get("id") == pv_thing_id:
+                        pv_thing_class_id = thing.get("thingClassId")
+                        break
+                
+                if not pv_thing_class_id:
+                    return
+                
+                # Get state types for this PV thing class
+                state_types_response = await self.client.send_request_with_response(
+                    "Integrations.GetStateTypes",
+                    {"thingClassId": pv_thing_class_id},
+                    timeout=10.0
+                )
+                
+                if state_types_response.get("status") == "success" and state_types_response.get("params", {}).get("stateTypes"):
+                    state_types = state_types_response["params"]["stateTypes"]
+                    
+                    # Build mapping of state type ID to state name
+                    self._pv_state_types[pv_thing_id] = {}
+                    for state_type in state_types:
+                        state_type_id = state_type.get("r:id") or state_type.get("id")
+                        state_name = state_type.get("name")
+                        if state_type_id and state_name:
+                            self._pv_state_types[pv_thing_id][state_type_id] = state_name
+                
+        except Exception as e:
+            _LOGGER.warning("Failed to fetch PV state types for %s: %s", pv_thing_id, e)
+
+    async def _subscribe_to_battery_states(self, battery_thing_id: str) -> None:
+        """Subscribe to state changes for a battery thing."""
+        if battery_thing_id not in self._battery_notification_tokens:
+            token = self.client.register_notification_callback(
+                lambda notification: self._handle_battery_notification(notification, battery_thing_id)
+            )
+            self._battery_notification_tokens[battery_thing_id] = token
+
+    async def _subscribe_to_pv_states(self, pv_thing_id: str) -> None:
+        """Subscribe to state changes for a PV thing."""
+        if pv_thing_id not in self._pv_notification_tokens:
+            token = self.client.register_notification_callback(
+                lambda notification: self._handle_pv_notification(notification, pv_thing_id)
+            )
+            self._pv_notification_tokens[pv_thing_id] = token
+
+    async def _unsubscribe_from_battery_states(self, battery_thing_id: str) -> None:
+        """Unsubscribe from state changes for a battery thing."""
+        token = self._battery_notification_tokens.pop(battery_thing_id, None)
+        if token:
+            self.client.unregister_notification_callback(token)
+
+    async def _unsubscribe_from_pv_states(self, pv_thing_id: str) -> None:
+        """Unsubscribe from state changes for a PV thing."""
+        token = self._pv_notification_tokens.pop(pv_thing_id, None)
+        if token:
+            self.client.unregister_notification_callback(token)
+
+    async def _fetch_battery_states(self, battery_thing_id: str) -> None:
+        """Fetch current state values for a battery thing."""
+        try:
+            response = await self.client.send_request_with_response(
+                "Integrations.GetStateValues", 
+                {"thingId": battery_thing_id},
+                timeout=10.0
+            )
+            
+            if response.get("status") == "success" and response.get("params", {}).get("values"):
+                values = response["params"]["values"]
+                
+                # Initialize battery states if not exists
+                if battery_thing_id not in self._battery_states:
+                    self._battery_states[battery_thing_id] = {}
+                
+                # Update battery states
+                for state in values:
+                    state_type_id = state.get("stateTypeId")
+                    value = state.get("value")
+                    
+                    if state_type_id and value is not None:
+                        state_name = self._battery_state_types.get(battery_thing_id, {}).get(state_type_id)
+                        if state_name:
+                            self._battery_states[battery_thing_id][state_name] = value
+                
+                # Update aggregated data
+                await self._update_aggregated_data()
+                
+        except Exception as e:
+            _LOGGER.warning("Failed to fetch battery states for %s: %s", battery_thing_id, e)
+
+    async def _fetch_pv_states(self, pv_thing_id: str) -> None:
+        """Fetch current state values for a PV thing."""
+        try:
+            response = await self.client.send_request_with_response(
+                "Integrations.GetStateValues", 
+                {"thingId": pv_thing_id},
+                timeout=10.0
+            )
+            
+            if response.get("status") == "success" and response.get("params", {}).get("values"):
+                values = response["params"]["values"]
+                
+                # Initialize PV states if not exists
+                if pv_thing_id not in self._pv_states:
+                    self._pv_states[pv_thing_id] = {}
+                
+                # Update PV states
+                for state in values:
+                    state_type_id = state.get("stateTypeId")
+                    value = state.get("value")
+                    
+                    if state_type_id and value is not None:
+                        state_name = self._pv_state_types.get(pv_thing_id, {}).get(state_type_id)
+                        if state_name:
+                            self._pv_states[pv_thing_id][state_name] = value
+                
+                # Update aggregated data
+                await self._update_aggregated_data()
+                
+        except Exception as e:
+            _LOGGER.warning("Failed to fetch PV states for %s: %s", pv_thing_id, e)
+
+    @callback
+    def _handle_battery_notification(self, notification: Dict[str, Any], battery_thing_id: str) -> None:
+        """Handle state change notifications for a battery thing."""
+        method = notification.get("method") or notification.get("notification")
+        if not method or "Integrations.StateChanged" not in method:
+            return
+        
+        params = notification.get("params", {})
+        thing_id = params.get("thingId")
+        
+        if thing_id != battery_thing_id:
+            return
+            
+        state_type_id = params.get("stateTypeId")
+        value = params.get("value")
+        
+        if value is None:
+            return
+            
+        # Use state type mapping to get state name
+        state_name = self._battery_state_types.get(battery_thing_id, {}).get(state_type_id)
+        
+        if state_name:
+            # Update battery state
+            if battery_thing_id not in self._battery_states:
+                self._battery_states[battery_thing_id] = {}
+            
+            self._battery_states[battery_thing_id][state_name] = value
+            
+            # Update aggregated data
+            self.hass.async_create_task(self._update_aggregated_data())
+        else:
+            # Fetch state types if we don't have mapping
+            self.hass.async_create_task(self._fetch_battery_state_types(battery_thing_id))
+
+    @callback
+    def _handle_pv_notification(self, notification: Dict[str, Any], pv_thing_id: str) -> None:
+        """Handle state change notifications for a PV thing."""
+        method = notification.get("method") or notification.get("notification")
+        if not method or "Integrations.StateChanged" not in method:
+            return
+        
+        params = notification.get("params", {})
+        thing_id = params.get("thingId")
+        
+        if thing_id != pv_thing_id:
+            return
+            
+        state_type_id = params.get("stateTypeId")
+        value = params.get("value")
+        
+        if value is None:
+            return
+            
+        # Use state type mapping to get state name
+        state_name = self._pv_state_types.get(pv_thing_id, {}).get(state_type_id)
+        
+        if state_name:
+            # Update PV state
+            if pv_thing_id not in self._pv_states:
+                self._pv_states[pv_thing_id] = {}
+            
+            self._pv_states[pv_thing_id][state_name] = value
+            
+            # Update aggregated data
+            self.hass.async_create_task(self._update_aggregated_data())
+        else:
+            # Fetch state types if we don't have mapping
+            self.hass.async_create_task(self._fetch_pv_state_types(pv_thing_id))
+
+    async def _update_aggregated_data(self) -> None:
+        """Update aggregated data for inverter group and battery group."""
+        aggregated_data = {}
+        
+        # Aggregate inverter data
+        total_inverter_power = 0.0
+        total_inverter_energy = 0.0
+        
+        for pv_id, states in self._pv_states.items():
+            current_power = states.get("currentPower")
+            total_energy = states.get("totalEnergyProduced")
+            
+            if current_power is not None:
+                total_inverter_power += float(current_power)
+            if total_energy is not None:
+                total_inverter_energy += float(total_energy)
+        
+        aggregated_data["inverter_group_current_power"] = total_inverter_power
+        aggregated_data["inverter_group_total_energy"] = total_inverter_energy
+        
+        # Aggregate battery data
+        total_battery_power = 0.0
+        
+        for battery_id, states in self._battery_states.items():
+            current_power = states.get("currentPower")
+            
+            if current_power is not None:
+                total_battery_power += float(current_power)
+        
+        aggregated_data["battery_group_current_power"] = total_battery_power
+        
+        # Update coordinator data with aggregated values
+        self._aggregated_data = aggregated_data
+        self.async_set_updated_data({**self.data, **aggregated_data})

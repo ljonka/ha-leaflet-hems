@@ -9,13 +9,13 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfPower, UnitOfEnergy
+from homeassistant.const import UnitOfPower, UnitOfEnergy, PERCENTAGE
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, NAME, VERSION, CONF_NYMEA_UUID, CONF_NYMEA_NAME
+from .const import DOMAIN, NAME, VERSION, CONF_NYMEA_UUID, CONF_NYMEA_NAME, DEVICE_TYPE_BATTERY, DEVICE_TYPE_INVERTER
 from .client import NymeaClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -111,7 +111,90 @@ async def async_setup_entry(
         )
         entities.append(entity)
 
+    # Create aggregated group sensors
+    aggregated_sensors = [
+        {
+            "type": "inverter_group_current_power",
+            "name": "Inverter Group Current Power",
+        },
+        {
+            "type": "inverter_group_total_energy",
+            "name": "Inverter Group Total Energy",
+        },
+        {
+            "type": "battery_group_current_power", 
+            "name": "Battery Group Current Power",
+        },
+    ]
+    
+    for sensor_config in aggregated_sensors:
+        entity = LeafletAggregatedSensor(
+            coordinator=coordinator,
+            config_entry=config_entry,
+            nymea_uuid=nymea_uuid,
+            nymea_name=nymea_name,
+            sensor_type=sensor_config["type"],
+            sensor_name=sensor_config["name"],
+        )
+        entities.append(entity)
+
     async_add_entities(entities, True)
+
+    # Set up dynamic sensors for batteries and inverters
+    @callback
+    def _create_dynamic_sensors():
+        """Create dynamic sensors for batteries and inverters."""
+        new_entities = []
+        
+        # Create battery sensors
+        for battery_id, battery_config in coordinator._battery_configs.items():
+            battery_sensors = [
+                {"type": "batteryLevel", "name": "Battery Level"},
+                {"type": "chargingState", "name": "Charging State"},
+                {"type": "currentPower", "name": "Current Power"},
+            ]
+            
+            for sensor_config in battery_sensors:
+                entity = LeafletBatterySensor(
+                    coordinator=coordinator,
+                    config_entry=config_entry,
+                    nymea_uuid=nymea_uuid,
+                    nymea_name=nymea_name,
+                    battery_thing_id=battery_id,
+                    sensor_type=sensor_config["type"],
+                    sensor_name=sensor_config["name"],
+                )
+                new_entities.append(entity)
+        
+        # Create inverter sensors
+        for pv_id, pv_config in coordinator._pv_configs.items():
+            inverter_sensors = [
+                {"type": "currentPower", "name": "Current Power"},
+                {"type": "totalEnergyProduced", "name": "Total Energy Produced"},
+            ]
+            
+            for sensor_config in inverter_sensors:
+                entity = LeafletInverterSensor(
+                    coordinator=coordinator,
+                    config_entry=config_entry,
+                    nymea_uuid=nymea_uuid,
+                    nymea_name=nymea_name,
+                    pv_thing_id=pv_id,
+                    sensor_type=sensor_config["type"],
+                    sensor_name=sensor_config["name"],
+                )
+                new_entities.append(entity)
+        
+        if new_entities:
+            async_add_entities(new_entities)
+
+    # Register callback for dynamic sensor creation
+    config_entry.async_on_unload(
+        coordinator.async_add_listener(_create_dynamic_sensors)
+    )
+    
+    # Initial creation of dynamic sensors
+    _create_dynamic_sensors()
 
 
 class LeafletPowerBalanceSensor(CoordinatorEntity, SensorEntity):
@@ -169,6 +252,203 @@ class LeafletPowerBalanceSensor(CoordinatorEntity, SensorEntity):
         """Return the native value of the sensor."""
         if self.coordinator.data and self._sensor_config["key"] in self.coordinator.data:
             return self.coordinator.data[self._sensor_config["key"]]
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Return if entity is available."""
+        return self.coordinator.last_update_success
+
+
+class LeafletBatterySensor(CoordinatorEntity, SensorEntity):
+    """Sensor for Leaflet HEMS battery data."""
+
+    def __init__(
+        self,
+        coordinator,
+        config_entry: ConfigEntry,
+        nymea_uuid: str,
+        nymea_name: str,
+        battery_thing_id: str,
+        sensor_type: str,
+        sensor_name: str,
+    ) -> None:
+        """Initialize the battery sensor."""
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._nymea_uuid = nymea_uuid
+        self._nymea_name = nymea_name
+        self._battery_thing_id = battery_thing_id
+        self._sensor_type = sensor_type
+        self._sensor_name = sensor_name
+        
+        # Sensor attributes
+        self._attr_name = f"{nymea_name} Battery {battery_thing_id[-8:]} {sensor_name}"
+        self._attr_unique_id = f"{nymea_uuid}_battery_{battery_thing_id}_{sensor_type}"
+        
+        # Set device class and unit based on sensor type
+        if sensor_type == "batteryLevel":
+            self._attr_device_class = SensorDeviceClass.BATTERY
+            self._attr_native_unit_of_measurement = PERCENTAGE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_icon = "mdi:battery"
+        elif sensor_type == "chargingState":
+            self._attr_device_class = None
+            self._attr_native_unit_of_measurement = None
+            self._attr_state_class = None
+            self._attr_icon = "mdi:battery-charging"
+        elif sensor_type == "currentPower":
+            self._attr_device_class = SensorDeviceClass.POWER
+            self._attr_native_unit_of_measurement = UnitOfPower.WATT
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_icon = "mdi:flash"
+        
+        # Device info
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{nymea_uuid}_battery_{battery_thing_id}")},
+            name=f"{nymea_name} Battery {battery_thing_id[-8:]}",
+            manufacturer="Consolinno",
+            model="Battery",
+            sw_version=VERSION,
+            via_device=(DOMAIN, nymea_uuid),
+        )
+
+    @property
+    def native_value(self):
+        """Return the native value of the sensor."""
+        if (self.coordinator._battery_states and 
+            self._battery_thing_id in self.coordinator._battery_states and
+            self._sensor_type in self.coordinator._battery_states[self._battery_thing_id]):
+            return self.coordinator._battery_states[self._battery_thing_id][self._sensor_type]
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Return if entity is available."""
+        return (self.coordinator.last_update_success and 
+                self._battery_thing_id in self.coordinator._battery_states)
+
+
+class LeafletInverterSensor(CoordinatorEntity, SensorEntity):
+    """Sensor for Leaflet HEMS inverter data."""
+
+    def __init__(
+        self,
+        coordinator,
+        config_entry: ConfigEntry,
+        nymea_uuid: str,
+        nymea_name: str,
+        pv_thing_id: str,
+        sensor_type: str,
+        sensor_name: str,
+    ) -> None:
+        """Initialize the inverter sensor."""
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._nymea_uuid = nymea_uuid
+        self._nymea_name = nymea_name
+        self._pv_thing_id = pv_thing_id
+        self._sensor_type = sensor_type
+        self._sensor_name = sensor_name
+        
+        # Sensor attributes
+        self._attr_name = f"{nymea_name} Inverter {pv_thing_id[-8:]} {sensor_name}"
+        self._attr_unique_id = f"{nymea_uuid}_inverter_{pv_thing_id}_{sensor_type}"
+        
+        # Set device class and unit based on sensor type
+        if sensor_type == "currentPower":
+            self._attr_device_class = SensorDeviceClass.POWER
+            self._attr_native_unit_of_measurement = UnitOfPower.WATT
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_icon = "mdi:solar-power"
+        elif sensor_type == "totalEnergyProduced":
+            self._attr_device_class = SensorDeviceClass.ENERGY
+            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            self._attr_state_class = SensorStateClass.TOTAL_INCREASING
+            self._attr_icon = "mdi:solar-panel"
+        
+        # Device info
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{nymea_uuid}_inverter_{pv_thing_id}")},
+            name=f"{nymea_name} Inverter {pv_thing_id[-8:]}",
+            manufacturer="Consolinno",
+            model="Inverter",
+            sw_version=VERSION,
+            via_device=(DOMAIN, nymea_uuid),
+        )
+
+    @property
+    def native_value(self):
+        """Return the native value of the sensor."""
+        if (self.coordinator._pv_states and 
+            self._pv_thing_id in self.coordinator._pv_states and
+            self._sensor_type in self.coordinator._pv_states[self._pv_thing_id]):
+            return self.coordinator._pv_states[self._pv_thing_id][self._sensor_type]
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Return if entity is available."""
+        return (self.coordinator.last_update_success and 
+                self._pv_thing_id in self.coordinator._pv_states)
+
+
+class LeafletAggregatedSensor(CoordinatorEntity, SensorEntity):
+    """Sensor for Leaflet HEMS aggregated data."""
+
+    def __init__(
+        self,
+        coordinator,
+        config_entry: ConfigEntry,
+        nymea_uuid: str,
+        nymea_name: str,
+        sensor_type: str,
+        sensor_name: str,
+    ) -> None:
+        """Initialize the aggregated sensor."""
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._nymea_uuid = nymea_uuid
+        self._nymea_name = nymea_name
+        self._sensor_type = sensor_type
+        self._sensor_name = sensor_name
+        
+        # Sensor attributes
+        self._attr_name = f"{nymea_name} {sensor_name}"
+        self._attr_unique_id = f"{nymea_uuid}_{sensor_type}"
+        
+        # Set device class and unit based on sensor type
+        if sensor_type == "inverter_group_current_power":
+            self._attr_device_class = SensorDeviceClass.POWER
+            self._attr_native_unit_of_measurement = UnitOfPower.WATT
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_icon = "mdi:solar-power"
+        elif sensor_type == "inverter_group_total_energy":
+            self._attr_device_class = SensorDeviceClass.ENERGY
+            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+            self._attr_state_class = SensorStateClass.TOTAL_INCREASING
+            self._attr_icon = "mdi:solar-panel"
+        elif sensor_type == "battery_group_current_power":
+            self._attr_device_class = SensorDeviceClass.POWER
+            self._attr_native_unit_of_measurement = UnitOfPower.WATT
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_icon = "mdi:battery"
+        
+        # Device info
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, nymea_uuid)},
+            name=nymea_name,
+            manufacturer="Consolinno",
+            model="Leaflet HEMS",
+            sw_version=VERSION,
+        )
+
+    @property
+    def native_value(self):
+        """Return the native value of the sensor."""
+        if (self.coordinator._aggregated_data and 
+            self._sensor_type in self.coordinator._aggregated_data):
+            return self.coordinator._aggregated_data[self._sensor_type]
         return None
 
     @property
