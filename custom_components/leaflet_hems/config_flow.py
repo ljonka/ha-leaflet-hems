@@ -223,31 +223,47 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_discovery_confirm(self, user_input: Optional[Dict[str, Any]] = None):
         """Handle discovery confirmation."""
         if not self._discovery_info:
+            _LOGGER.error("Discovery info missing in discovery_confirm step")
             return self.async_abort(reason="discovery_error")
 
         if user_input is not None:
             # User confirmed - check if authentication is needed
-            handshake_data = await self._async_perform_handshake(
-                self._discovery_info[CONF_HOST], 
-                self._discovery_info[CONF_PORT]
-            )
-            
-            if handshake_data and handshake_data.get("authentication_required"):
-                # Authentication required - go to auth step
-                return self.async_show_form(
-                    step_id="auth",
-                    data_schema=AUTH_SCHEMA,
-                    description_placeholders={
-                        "host": self._discovery_info[CONF_HOST],
-                        "name": self._discovery_info[CONF_NYMEA_NAME],
-                    },
+            try:
+                # Perform handshake to get current authentication status
+                handshake_data = await self._async_perform_handshake(
+                    self._discovery_info[CONF_HOST], 
+                    self._discovery_info[CONF_PORT]
                 )
-            else:
-                # No authentication required - create entry directly
-                return self.async_create_entry(
-                    title=self._discovery_info[CONF_NYMEA_NAME],
-                    data=self._discovery_info,
-                )
+                
+                if handshake_data:
+                    # Update discovery info with latest handshake data
+                    self._discovery_info.update({
+                        CONF_NYMEA_UUID: handshake_data.get("uuid", self._discovery_info[CONF_NYMEA_UUID]),
+                        CONF_NYMEA_NAME: handshake_data.get("name", self._discovery_info[CONF_NYMEA_NAME]),
+                    })
+                    
+                    if handshake_data.get("authentication_required"):
+                        _LOGGER.info("Authentication required for device %s, proceeding to auth step", 
+                                   self._discovery_info[CONF_NYMEA_NAME])
+                        # Authentication required - go to auth step
+                        return await self.async_step_auth()
+                    else:
+                        # No authentication required - create entry directly
+                        _LOGGER.info("Creating config entry for device %s without authentication", 
+                                   self._discovery_info[CONF_NYMEA_NAME])
+                        await self.async_set_unique_id(self._discovery_info[CONF_NYMEA_UUID])
+                        self._abort_if_unique_id_configured()
+                        return self.async_create_entry(
+                            title=self._discovery_info[CONF_NYMEA_NAME],
+                            data=self._discovery_info,
+                        )
+                else:
+                    _LOGGER.error("Failed to connect to device during discovery confirmation")
+                    return self.async_abort(reason="cannot_connect")
+                    
+            except Exception as e:
+                _LOGGER.error("Error during discovery confirmation: %s", e, exc_info=True)
+                return self.async_abort(reason="cannot_connect")
 
         # Show confirmation form
         return self.async_show_form(
@@ -267,6 +283,7 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         # Ensure discovery info exists
         if not self._discovery_info:
+            _LOGGER.error("Discovery info missing in auth step")
             errors["base"] = "cannot_connect"
             return self.async_show_form(
                 step_id="manual",
@@ -282,26 +299,34 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             username = user_input.get("username", "")
             password = user_input.get("password", "")
 
-            # Try to authenticate with provided credentials using stored host/port
-            auth_token = await self._async_perform_authentication(
-                host,
-                port,
-                username,
-                password,
-            )
-
-            if auth_token:
-                # Store the token in discovery info
-                self._discovery_info[CONF_NYMEA_TOKEN] = auth_token
-                await self.async_set_unique_id(self._discovery_info[CONF_NYMEA_UUID])
-                self._abort_if_unique_id_configured()
-                # Authentication succeeded — create the config entry immediately
-                return self.async_create_entry(
-                    title=self._discovery_info[CONF_NYMEA_NAME],
-                    data=self._discovery_info,
-                )
-            else:
+            if not username or not password:
                 errors["base"] = "invalid_auth"
+                _LOGGER.warning("Authentication attempt with empty username or password")
+            else:
+                # Try to authenticate with provided credentials using stored host/port
+                auth_token = await self._async_perform_authentication(
+                    host,
+                    port,
+                    username,
+                    password,
+                )
+
+                if auth_token:
+                    # Store the token in discovery info
+                    self._discovery_info[CONF_NYMEA_TOKEN] = auth_token
+                    await self.async_set_unique_id(self._discovery_info[CONF_NYMEA_UUID])
+                    self._abort_if_unique_id_configured()
+                    # Authentication succeeded — create the config entry immediately
+                    _LOGGER.info("Authentication successful, creating config entry for %s", 
+                               self._discovery_info[CONF_NYMEA_NAME])
+                    return self.async_create_entry(
+                        title=self._discovery_info[CONF_NYMEA_NAME],
+                        data=self._discovery_info,
+                    )
+                else:
+                    errors["base"] = "invalid_auth"
+                    _LOGGER.warning("Authentication failed for device %s", 
+                                  self._discovery_info[CONF_NYMEA_NAME])
 
         # Show authentication form
         return self.async_show_form(
