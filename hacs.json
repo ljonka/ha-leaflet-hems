@@ -1,6 +1,6 @@
 {
   "name": "Leaflet HEMS",
-  "render_readme": true,
-  "domains": ["sensor"],
-  "homeassistant": "2025.10.2"
+  "content_in_root": false,
+  "homeassistant": "2025.10.2",
+  "render_readme": true
 }
