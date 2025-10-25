@@ -14,6 +14,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN, NAME, VERSION, CONF_NYMEA_UUID, CONF_NYMEA_NAME, DEVICE_TYPE_BATTERY, DEVICE_TYPE_INVERTER
 from .client import NymeaClient
@@ -55,28 +56,28 @@ POWER_BALANCE_SENSORS = [
         "name": "Total Consumption",
         "device_class": SensorDeviceClass.ENERGY,
         "unit": UnitOfEnergy.KILO_WATT_HOUR,
-        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "state_class": SensorStateClass.TOTAL,
     },
     {
         "key": "totalProduction", 
         "name": "Total Production",
         "device_class": SensorDeviceClass.ENERGY,
         "unit": UnitOfEnergy.KILO_WATT_HOUR,
-        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "state_class": SensorStateClass.TOTAL,
     },
     {
         "key": "totalAcquisition",
         "name": "Total Acquisition", 
         "device_class": SensorDeviceClass.ENERGY,
         "unit": UnitOfEnergy.KILO_WATT_HOUR,
-        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "state_class": SensorStateClass.TOTAL,
     },
     {
         "key": "totalReturn",
         "name": "Total Return",
         "device_class": SensorDeviceClass.ENERGY,
         "unit": UnitOfEnergy.KILO_WATT_HOUR,
-        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "state_class": SensorStateClass.TOTAL,
     },
 ]
 
@@ -140,14 +141,22 @@ async def async_setup_entry(
 
     async_add_entities(entities, True)
 
+    # Get or create persistent tracking of added entities to prevent duplicates
+    if "added_thing_ids" not in entry_data:
+        entry_data["added_thing_ids"] = set()
+    added_thing_ids = entry_data["added_thing_ids"]
+
     # Set up dynamic sensors for batteries and inverters
     @callback
-    def _create_dynamic_sensors():
+    def _create_dynamic_sensors(async_add_entities_callback: AddEntitiesCallback):
         """Create dynamic sensors for batteries and inverters."""
-        new_entities = []
+        new_entities_to_add = []
         
         # Create battery sensors
         for battery_id, battery_config in coordinator._battery_configs.items():
+            if battery_id in added_thing_ids:
+                continue
+            
             battery_sensors = [
                 {"type": "batteryLevel", "name": "Battery Level"},
                 {"type": "chargingState", "name": "Charging State"},
@@ -155,6 +164,13 @@ async def async_setup_entry(
             ]
             
             for sensor_config in battery_sensors:
+                # Check if this specific sensor already exists in Home Assistant
+                unique_id = f"{nymea_uuid}_battery_{battery_id}_{sensor_config['type']}"
+                entity_registry = er.async_get(hass)
+                if entity_registry.async_get_entity_id("sensor", DOMAIN, unique_id):
+                    _LOGGER.debug("Sensor %s already exists, skipping creation", unique_id)
+                    continue
+                    
                 entity = LeafletBatterySensor(
                     coordinator=coordinator,
                     config_entry=config_entry,
@@ -164,16 +180,27 @@ async def async_setup_entry(
                     sensor_type=sensor_config["type"],
                     sensor_name=sensor_config["name"],
                 )
-                new_entities.append(entity)
+                new_entities_to_add.append(entity)
+            added_thing_ids.add(battery_id)
         
         # Create inverter sensors
         for pv_id, pv_config in coordinator._pv_configs.items():
+            if pv_id in added_thing_ids:
+                continue
+
             inverter_sensors = [
                 {"type": "currentPower", "name": "Current Power"},
                 {"type": "totalEnergyProduced", "name": "Total Energy Produced"},
             ]
             
             for sensor_config in inverter_sensors:
+                # Check if this specific sensor already exists in Home Assistant
+                unique_id = f"{nymea_uuid}_inverter_{pv_id}_{sensor_config['type']}"
+                entity_registry = er.async_get(hass)
+                if entity_registry.async_get_entity_id("sensor", DOMAIN, unique_id):
+                    _LOGGER.debug("Sensor %s already exists, skipping creation", unique_id)
+                    continue
+                    
                 entity = LeafletInverterSensor(
                     coordinator=coordinator,
                     config_entry=config_entry,
@@ -183,18 +210,19 @@ async def async_setup_entry(
                     sensor_type=sensor_config["type"],
                     sensor_name=sensor_config["name"],
                 )
-                new_entities.append(entity)
+                new_entities_to_add.append(entity)
+            added_thing_ids.add(pv_id)
         
-        if new_entities:
-            async_add_entities(new_entities)
+        if new_entities_to_add:
+            async_add_entities_callback(new_entities_to_add)
 
-    # Register callback for dynamic sensor creation
-    config_entry.async_on_unload(
-        coordinator.async_add_listener(_create_dynamic_sensors)
-    )
-    
     # Initial creation of dynamic sensors
-    _create_dynamic_sensors()
+    _create_dynamic_sensors(async_add_entities)
+
+    # Register callback for dynamic sensor creation for newly added devices
+    config_entry.async_on_unload(
+        coordinator.async_add_listener(lambda: _create_dynamic_sensors(async_add_entities))
+    )
 
 
 class LeafletPowerBalanceSensor(CoordinatorEntity, SensorEntity):

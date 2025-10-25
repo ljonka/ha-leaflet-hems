@@ -455,15 +455,10 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                         def _on_wait_closed(t: asyncio.Task) -> None:
                             try:
                                 _ = t.result()
-                            except asyncio.TimeoutError:
-                                # SSL shutdown timeouts are common and not critical
-                                _LOGGER.debug("SSL shutdown timed out during connection cleanup")
-                            except Exception as exc:
-                                # Only log other exceptions as warnings
-                                if "SSL shutdown timed out" not in str(exc):
-                                    _LOGGER.warning("wait_closed raised: %s", exc)
-                                else:
-                                    _LOGGER.debug("SSL shutdown timeout: %s", exc)
+                            except:
+                                # Ignore all exceptions during cleanup - this is best effort
+                                # and failures here are not critical since we're shutting down
+                                pass
                         try:
                             task.add_done_callback(_on_wait_closed)
                         except Exception:

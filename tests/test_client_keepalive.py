@@ -36,7 +36,7 @@ async def test_keepalive_start_stop():
             payload = call[0][0]  # First argument
             assert payload["method"] == "JSONRPC.KeepAlive"
             assert "id" in payload
-            assert payload["params"] == {}
+            assert payload["params"] == {"sessionId": None}
 
 
 @pytest.mark.asyncio

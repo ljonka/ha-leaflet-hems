@@ -83,6 +83,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Start reader loop for notifications and responses
         await nymea_client.start_reader_loop()
         
+        # Start keepalive loop to monitor connection health
+        await nymea_client.start_keepalive()
+        
         # Skip introspection to avoid buffer overflow issues
         # Enable notifications for Energy and Integrations namespaces
         try:
@@ -127,6 +130,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.data[DOMAIN][entry.entry_id]["notification_token"] = token_cb
         except Exception:
             pass
+
+    # Register coordinator reconnection callback to refresh data after reconnect
+    try:
+        nymea_client.register_reconnection_callback(coordinator._handle_reconnection)
+    except Exception:
+        pass
 
 
     # Forward entry setups to platforms (sensor)
@@ -442,6 +451,11 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         """Fetch data from Leaflet HEMS (used for initial fetch/fallback)."""
         data = {}
         
+        # Ensure we have a healthy connection before attempting data fetch
+        if not await self.client.ensure_connected():
+            _LOGGER.warning("Cannot fetch data - no healthy connection to Nymea server")
+            return data
+        
         # First, try to get power balance data (excluding totalAcquisition/totalReturn)
         try:
             response = await self.client.send_request_with_response("Energy.GetPowerBalance", timeout=10.0)
@@ -454,8 +468,8 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
                     if key not in ["totalAcquisition", "totalReturn"]:
                         data[key] = power_balance_data[key]
                 
-        except Exception:
-            pass
+        except Exception as e:
+            _LOGGER.warning("Failed to fetch power balance data: %s", e)
         
         # Always get totalAcquisition and totalReturn from root meter if available
         if self._root_meter_thing_id:
@@ -488,8 +502,8 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
                             elif state_name == "totalEnergyProduced":
                                 data["totalReturn"] = value
                     
-            except Exception:
-                pass
+            except Exception as e:
+                _LOGGER.warning("Failed to fetch root meter states: %s", e)
         
         return data
 
@@ -908,3 +922,84 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         # Update coordinator data with aggregated values
         self._aggregated_data = aggregated_data
         self.async_set_updated_data({**self.data, **aggregated_data})
+
+    @callback
+    def _handle_reconnection(self) -> None:
+        """Handle client reconnection by refreshing all data."""
+        _LOGGER.info("Client reconnected, refreshing all data")
+        # Schedule a full refresh of all data after reconnection
+        self.hass.async_create_task(self._refresh_after_reconnection())
+
+    async def _refresh_after_reconnection(self) -> None:
+        """Refresh all data after reconnection."""
+        try:
+            # Give the connection a moment to stabilize
+            await asyncio.sleep(1.0)
+            
+            # Verify connection is healthy before proceeding
+            if not await self.client.verify_connection_health():
+                _LOGGER.warning("Connection not healthy during reconnection refresh")
+                return
+            
+            _LOGGER.info("Starting full data refresh after reconnection")
+            
+            # Re-enable notifications at JSONRPC level
+            try:
+                notify_response = await self.client.send_request_with_response(
+                    "JSONRPC.SetNotificationStatus", 
+                    {"namespaces": ["Energy", "Integrations"]},
+                    timeout=10.0
+                )
+                if notify_response.get("status") == "success":
+                    _LOGGER.info("Notifications re-enabled after reconnection")
+                else:
+                    _LOGGER.warning("Failed to re-enable notifications: %s", notify_response)
+            except Exception as e:
+                _LOGGER.warning("Failed to re-enable notifications: %s", e)
+            
+            # Clear old subscriptions - they're no longer valid after reconnection
+            # The notification callbacks are still registered in the client, but we need
+            # to re-fetch configurations which will re-subscribe to the correct things
+            _LOGGER.debug("Clearing old notification tokens")
+            self._root_meter_notification_token = None
+            self._battery_notification_tokens.clear()
+            self._pv_notification_tokens.clear()
+            
+            # Refresh root meter configuration and re-subscribe
+            try:
+                _LOGGER.debug("Re-fetching root meter configuration")
+                await self._update_root_meter()
+                _LOGGER.info("Root meter configuration refreshed after reconnection")
+            except Exception as e:
+                _LOGGER.warning("Failed to update root meter after reconnection: %s", e)
+            
+            # Refresh battery configurations and re-subscribe
+            try:
+                _LOGGER.debug("Re-fetching battery configurations")
+                await self._update_battery_configs()
+                _LOGGER.info("Battery configurations refreshed after reconnection (%d batteries)", len(self._battery_configs))
+            except Exception as e:
+                _LOGGER.warning("Failed to update battery configs after reconnection: %s", e)
+            
+            # Refresh PV configurations and re-subscribe
+            try:
+                _LOGGER.debug("Re-fetching PV configurations")
+                await self._update_pv_configs()
+                _LOGGER.info("PV configurations refreshed after reconnection (%d inverters)", len(self._pv_configs))
+            except Exception as e:
+                _LOGGER.warning("Failed to update PV configs after reconnection: %s", e)
+            
+            # Force a full data update to populate all sensor values
+            try:
+                _LOGGER.debug("Fetching initial data after reconnection")
+                data = await self._async_update_data()
+                if data:
+                    self.async_set_updated_data(data)
+                    _LOGGER.info("Data refresh after reconnection completed successfully - %d data points", len(data))
+                else:
+                    _LOGGER.warning("No data received during reconnection refresh")
+            except Exception as e:
+                _LOGGER.warning("Failed to update data after reconnection: %s", e)
+                
+        except Exception as e:
+            _LOGGER.error("Critical error during reconnection refresh: %s", e)
