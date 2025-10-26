@@ -31,6 +31,8 @@ from .const import (
     HEMS_PV_REMOVED,
     DEVICE_TYPE_BATTERY,
     DEVICE_TYPE_INVERTER,
+    BATTERY_STATE_MAPPINGS,
+    INVERTER_STATE_MAPPINGS,
 )
 from .client import NymeaClient
 
@@ -137,6 +139,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except Exception:
         pass
 
+    # Register coordinator disconnection callback to mark all sensors as unavailable
+    try:
+        nymea_client.register_disconnection_callback(coordinator._handle_disconnection)
+    except Exception:
+        pass
+
 
     # Forward entry setups to platforms (sensor)
     try:
@@ -219,6 +227,17 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         self._battery_notification_tokens: Dict[str, str] = {}  # battery_thing_id -> token
         self._pv_notification_tokens: Dict[str, str] = {}  # pv_thing_id -> token
         self._aggregated_data: Dict[str, float] = {}  # Aggregated values for groups
+
+        # Hardcoded state name mappings (API returns underscore_separated, sensors expect camelCase)
+        self._expected_battery_state_names = {
+            "battery_level": "batteryLevel",
+            "charging_state": "chargingState",
+            "current_power": "currentPower"
+        }
+        self._expected_pv_state_names = {
+            "current_power": "currentPower",
+            "total_energy_produced": "totalEnergyProduced"
+        }
 
     async def async_start(self) -> None:
         """Start background tasks: query root meter and subscribe to its changes."""
@@ -558,31 +577,44 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         if changed:
             self.async_set_updated_data(new_data)
 
-    async def _update_battery_configs(self) -> None:
-        """Query Hems.GetBatteryConfigurations and subscribe to battery state changes."""
+    async def _update_battery_configs(self, force_refresh: bool = False) -> None:
+        """Query Hems.GetBatteryConfigurations and subscribe to battery state changes.
+        
+        Args:
+            force_refresh: If True, refetch states for all batteries even if already configured.
+        """
         try:
             response = await self.client.send_request_with_response(HEMS_GET_BATTERY_CONFIGS, timeout=10.0)
-            
+
             if response.get("status") == "success" and response.get("params", {}).get("batteryConfigurations"):
                 battery_configs = response["params"]["batteryConfigurations"]
+                _LOGGER.info("Found %d battery configurations", len(battery_configs))
                 current_battery_ids = set(self._battery_configs.keys())
                 new_battery_ids = set()
-                
+
                 for config in battery_configs:
                     battery_thing_id = config.get("batteryThingId")
+                    _LOGGER.debug("Processing battery config for thingId: %s", battery_thing_id)
                     if battery_thing_id:
                         new_battery_ids.add(battery_thing_id)
-                        if battery_thing_id not in self._battery_configs:
-                            # New battery configuration
-                            self._battery_configs[battery_thing_id] = config
+                        is_new = battery_thing_id not in self._battery_configs
+                        
+                        # Always update the configuration
+                        self._battery_configs[battery_thing_id] = config
+                        
+                        if is_new:
+                            # New battery configuration - full setup
                             await self._fetch_battery_state_types(battery_thing_id)
                             await self._subscribe_to_battery_states(battery_thing_id)
                             await self._fetch_battery_states(battery_thing_id)
                             _LOGGER.info("Added battery configuration: %s", battery_thing_id)
-                        else:
-                            # Update existing configuration if needed
-                            self._battery_configs[battery_thing_id] = config
-                
+                        elif force_refresh:
+                            # Existing battery but force refresh requested (e.g., after reconnection)
+                            # Refetch state types and states to repopulate cleared data
+                            await self._fetch_battery_state_types(battery_thing_id)
+                            await self._fetch_battery_states(battery_thing_id)
+                            _LOGGER.info("Refreshed battery states after reconnection: %s", battery_thing_id)
+
                 # Remove batteries that are no longer present
                 removed_battery_ids = current_battery_ids - new_battery_ids
                 for battery_id in removed_battery_ids:
@@ -591,15 +623,21 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
                     self._battery_states.pop(battery_id, None)
                     self._battery_state_types.pop(battery_id, None)
                     _LOGGER.info("Removed battery configuration: %s", battery_id)
-                
-                # Update aggregated data
+
+                _LOGGER.info("Battery configurations updated. New batteries: %s, Removed batteries: %s", new_battery_ids, removed_battery_ids)
+
+                # Update aggregated data - this also triggers sensor updates via coordinator data
                 await self._update_aggregated_data()
-                
+
         except Exception as e:
             _LOGGER.warning("Failed to fetch battery configurations: %s", e)
 
-    async def _update_pv_configs(self) -> None:
-        """Query Hems.GetPvConfigurations and subscribe to PV state changes."""
+    async def _update_pv_configs(self, force_refresh: bool = False) -> None:
+        """Query Hems.GetPvConfigurations and subscribe to PV state changes.
+        
+        Args:
+            force_refresh: If True, refetch states for all PVs even if already configured.
+        """
         try:
             response = await self.client.send_request_with_response(HEMS_GET_PV_CONFIGS, timeout=10.0)
             
@@ -612,16 +650,23 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
                     pv_thing_id = config.get("pvThingId")
                     if pv_thing_id:
                         new_pv_ids.add(pv_thing_id)
-                        if pv_thing_id not in self._pv_configs:
-                            # New PV configuration
-                            self._pv_configs[pv_thing_id] = config
+                        is_new = pv_thing_id not in self._pv_configs
+                        
+                        # Always update the configuration
+                        self._pv_configs[pv_thing_id] = config
+                        
+                        if is_new:
+                            # New PV configuration - full setup
                             await self._fetch_pv_state_types(pv_thing_id)
                             await self._subscribe_to_pv_states(pv_thing_id)
                             await self._fetch_pv_states(pv_thing_id)
                             _LOGGER.info("Added PV configuration: %s", pv_thing_id)
-                        else:
-                            # Update existing configuration if needed
-                            self._pv_configs[pv_thing_id] = config
+                        elif force_refresh:
+                            # Existing PV but force refresh requested (e.g., after reconnection)
+                            # Refetch state types and states to repopulate cleared data
+                            await self._fetch_pv_state_types(pv_thing_id)
+                            await self._fetch_pv_states(pv_thing_id)
+                            _LOGGER.info("Refreshed PV states after reconnection: %s", pv_thing_id)
                 
                 # Remove PVs that are no longer present
                 removed_pv_ids = current_pv_ids - new_pv_ids
@@ -632,9 +677,9 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
                     self._pv_state_types.pop(pv_id, None)
                     _LOGGER.info("Removed PV configuration: %s", pv_id)
                 
-                # Update aggregated data
+                # Update aggregated data - this also triggers sensor updates via coordinator data
                 await self._update_aggregated_data()
-                
+
         except Exception as e:
             _LOGGER.warning("Failed to fetch PV configurations: %s", e)
 
@@ -757,64 +802,88 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
     async def _fetch_battery_states(self, battery_thing_id: str) -> None:
         """Fetch current state values for a battery thing."""
         try:
+            _LOGGER.debug("Fetching battery states for %s", battery_thing_id)
             response = await self.client.send_request_with_response(
-                "Integrations.GetStateValues", 
+                "Integrations.GetStateValues",
                 {"thingId": battery_thing_id},
                 timeout=10.0
             )
-            
+
             if response.get("status") == "success" and response.get("params", {}).get("values"):
                 values = response["params"]["values"]
-                
+                _LOGGER.debug("Retrieved %d raw state values for battery %s", len(values), battery_thing_id)
+
                 # Initialize battery states if not exists
                 if battery_thing_id not in self._battery_states:
                     self._battery_states[battery_thing_id] = {}
-                
-                # Update battery states
+
+                # Update battery states - use constant mappings directly
                 for state in values:
                     state_type_id = state.get("stateTypeId")
                     value = state.get("value")
-                    
+
                     if state_type_id and value is not None:
-                        state_name = self._battery_state_types.get(battery_thing_id, {}).get(state_type_id)
-                        if state_name:
-                            self._battery_states[battery_thing_id][state_name] = value
-                
+                        # Get state type name from state type mapping
+                        state_type_name = self._battery_state_types.get(battery_thing_id, {}).get(state_type_id)
+                        if state_type_name and state_type_name in BATTERY_STATE_MAPPINGS:
+                            # Use the constant mapping value as the sensor name (already correct)
+                            sensor_name = BATTERY_STATE_MAPPINGS[state_type_name]
+                            old_value = self._battery_states[battery_thing_id].get(sensor_name)
+                            self._battery_states[battery_thing_id][sensor_name] = value
+                            _LOGGER.debug("Mapped battery state for %s: '%s' = %s (was: %s)",
+                                        battery_thing_id, sensor_name, value, old_value)
+                        else:
+                            _LOGGER.debug("Ignoring battery state for %s: state_type_id=%s, name=%s, value=%s",
+                                        battery_thing_id, state_type_id, state_type_name, value)
+
+                _LOGGER.debug("Battery states after mapping for %s: %s", battery_thing_id, self._battery_states[battery_thing_id])
                 # Update aggregated data
                 await self._update_aggregated_data()
-                
+
         except Exception as e:
             _LOGGER.warning("Failed to fetch battery states for %s: %s", battery_thing_id, e)
 
     async def _fetch_pv_states(self, pv_thing_id: str) -> None:
         """Fetch current state values for a PV thing."""
         try:
+            _LOGGER.debug("Fetching PV states for %s", pv_thing_id)
             response = await self.client.send_request_with_response(
-                "Integrations.GetStateValues", 
+                "Integrations.GetStateValues",
                 {"thingId": pv_thing_id},
                 timeout=10.0
             )
-            
+
             if response.get("status") == "success" and response.get("params", {}).get("values"):
                 values = response["params"]["values"]
-                
+                _LOGGER.debug("Retrieved %d raw state values for PV %s", len(values), pv_thing_id)
+
                 # Initialize PV states if not exists
                 if pv_thing_id not in self._pv_states:
                     self._pv_states[pv_thing_id] = {}
-                
-                # Update PV states
+
+                # Update PV states - use constant mappings directly
                 for state in values:
                     state_type_id = state.get("stateTypeId")
                     value = state.get("value")
-                    
+
                     if state_type_id and value is not None:
-                        state_name = self._pv_state_types.get(pv_thing_id, {}).get(state_type_id)
-                        if state_name:
-                            self._pv_states[pv_thing_id][state_name] = value
-                
+                        # Get state type name from state type mapping
+                        state_type_name = self._pv_state_types.get(pv_thing_id, {}).get(state_type_id)
+                        if state_type_name and state_type_name in INVERTER_STATE_MAPPINGS:
+                            # Use the constant mapping value as the sensor name (already correct)
+                            sensor_name = INVERTER_STATE_MAPPINGS[state_type_name]
+                            old_value = self._pv_states[pv_thing_id].get(sensor_name)
+                            self._pv_states[pv_thing_id][sensor_name] = value
+                            _LOGGER.debug("Mapped PV state for %s: '%s' = %s (was: %s)",
+                                        pv_thing_id, sensor_name, value, old_value)
+                        else:
+                            _LOGGER.debug("Ignoring PV state for %s: state_type_id=%s, name=%s, value=%s",
+                                        pv_thing_id, state_type_id, state_type_name, value)
+
+                _LOGGER.debug("PV states after mapping for %s: %s", pv_thing_id, self._pv_states[pv_thing_id])
                 # Update aggregated data
                 await self._update_aggregated_data()
-                
+
         except Exception as e:
             _LOGGER.warning("Failed to fetch PV states for %s: %s", pv_thing_id, e)
 
@@ -824,33 +893,43 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         method = notification.get("method") or notification.get("notification")
         if not method or "Integrations.StateChanged" not in method:
             return
-        
+
         params = notification.get("params", {})
+        _LOGGER.debug("Battery notification received: %s", notification)
         thing_id = params.get("thingId")
-        
+
         if thing_id != battery_thing_id:
             return
-            
+
         state_type_id = params.get("stateTypeId")
         value = params.get("value")
-        
+
         if value is None:
             return
-            
-        # Use state type mapping to get state name
-        state_name = self._battery_state_types.get(battery_thing_id, {}).get(state_type_id)
-        
-        if state_name:
+
+        # Use state type mapping to get state name, then check if we want this state
+        state_type_name = self._battery_state_types.get(battery_thing_id, {}).get(state_type_id)
+        _LOGGER.debug("Battery state change for %s: state_type_id=%s, state_type_name='%s', value=%s",
+                     battery_thing_id, state_type_id, state_type_name, value)
+
+        if state_type_name and state_type_name in BATTERY_STATE_MAPPINGS:
+            sensor_name = BATTERY_STATE_MAPPINGS[state_type_name]
+
             # Update battery state
             if battery_thing_id not in self._battery_states:
                 self._battery_states[battery_thing_id] = {}
-            
-            self._battery_states[battery_thing_id][state_name] = value
-            
-            # Update aggregated data
-            self.hass.async_create_task(self._update_aggregated_data())
+
+            old_value = self._battery_states[battery_thing_id].get(sensor_name)
+            if old_value != value:
+                self._battery_states[battery_thing_id][sensor_name] = value
+                _LOGGER.debug("Updated battery state '%s' for %s: %s -> %s",
+                             sensor_name, battery_thing_id, old_value, value)
+
+                # Update aggregated data
+                self.hass.async_create_task(self._update_aggregated_data())
         else:
             # Fetch state types if we don't have mapping
+            _LOGGER.debug("Unknown battery state type %s for %s, refetching state types", state_type_id, battery_thing_id)
             self.hass.async_create_task(self._fetch_battery_state_types(battery_thing_id))
 
     @callback
@@ -859,33 +938,40 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         method = notification.get("method") or notification.get("notification")
         if not method or "Integrations.StateChanged" not in method:
             return
-        
+
         params = notification.get("params", {})
         thing_id = params.get("thingId")
-        
+
         if thing_id != pv_thing_id:
             return
-            
+
         state_type_id = params.get("stateTypeId")
         value = params.get("value")
-        
+
         if value is None:
             return
-            
-        # Use state type mapping to get state name
-        state_name = self._pv_state_types.get(pv_thing_id, {}).get(state_type_id)
-        
-        if state_name:
+
+        # Use state type mapping to get state name, then check if we want this state
+        state_type_name = self._pv_state_types.get(pv_thing_id, {}).get(state_type_id)
+
+        if state_type_name and state_type_name in INVERTER_STATE_MAPPINGS:
+            sensor_name = INVERTER_STATE_MAPPINGS[state_type_name]
+
             # Update PV state
             if pv_thing_id not in self._pv_states:
                 self._pv_states[pv_thing_id] = {}
-            
-            self._pv_states[pv_thing_id][state_name] = value
-            
-            # Update aggregated data
-            self.hass.async_create_task(self._update_aggregated_data())
+
+            old_value = self._pv_states[pv_thing_id].get(sensor_name)
+            if old_value != value:
+                self._pv_states[pv_thing_id][sensor_name] = value
+                _LOGGER.debug("Updated PV state '%s' for %s: %s -> %s",
+                             sensor_name, pv_thing_id, old_value, value)
+
+                # Update aggregated data
+                self.hass.async_create_task(self._update_aggregated_data())
         else:
             # Fetch state types if we don't have mapping
+            _LOGGER.debug("Unknown PV state type %s for %s, refetching state types", state_type_id, pv_thing_id)
             self.hass.async_create_task(self._fetch_pv_state_types(pv_thing_id))
 
     async def _update_aggregated_data(self) -> None:
@@ -919,9 +1005,46 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
         
         aggregated_data["battery_group_current_power"] = total_battery_power
         
-        # Update coordinator data with aggregated values
+        # Update coordinator data with aggregated values and individual device states
+        device_states = {}
+        for battery_id, states in self._battery_states.items():
+            for state_type, value in states.items():
+                device_states[f"battery_{battery_id}_{state_type}"] = value
+
+        for pv_id, states in self._pv_states.items():
+            for state_type, value in states.items():
+                device_states[f"pv_{pv_id}_{state_type}"] = value
+
         self._aggregated_data = aggregated_data
-        self.async_set_updated_data({**self.data, **aggregated_data})
+        new_data = {**self.data, **aggregated_data, **device_states}
+        self.async_set_updated_data(new_data)
+
+    @callback
+    def _handle_disconnection(self) -> None:
+        """Handle client disconnection by clearing all data to mark sensors as unavailable."""
+        _LOGGER.warning("Connection to Nymea lost - marking all sensors as unavailable")
+        
+        # Clear all coordinator data immediately
+        # This will cause all sensors to become unavailable as they check for data presence
+        self._data.clear()
+        
+        # Clear aggregated data
+        self._aggregated_data.clear()
+        
+        # Clear battery and PV states (but keep configs for when reconnection happens)
+        for battery_id in self._battery_states:
+            self._battery_states[battery_id].clear()
+        
+        for pv_id in self._pv_states:
+            self._pv_states[pv_id].clear()
+        
+        # Mark coordinator update as failed to ensure sensors show unavailable
+        self.last_update_success = False
+        
+        # Update coordinator with empty data to trigger sensor state updates
+        self.async_set_updated_data({})
+        
+        _LOGGER.info("All sensor data cleared - sensors will show as unavailable until reconnection")
 
     @callback
     def _handle_reconnection(self) -> None:
@@ -932,74 +1055,125 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator):
 
     async def _refresh_after_reconnection(self) -> None:
         """Refresh all data after reconnection."""
-        try:
-            # Give the connection a moment to stabilize
-            await asyncio.sleep(1.0)
-            
-            # Verify connection is healthy before proceeding
-            if not await self.client.verify_connection_health():
-                _LOGGER.warning("Connection not healthy during reconnection refresh")
-                return
-            
-            _LOGGER.info("Starting full data refresh after reconnection")
-            
-            # Re-enable notifications at JSONRPC level
+        max_retries = 3
+        
+        for retry in range(max_retries):
             try:
-                notify_response = await self.client.send_request_with_response(
-                    "JSONRPC.SetNotificationStatus", 
-                    {"namespaces": ["Energy", "Integrations"]},
-                    timeout=10.0
-                )
-                if notify_response.get("status") == "success":
-                    _LOGGER.info("Notifications re-enabled after reconnection")
-                else:
-                    _LOGGER.warning("Failed to re-enable notifications: %s", notify_response)
-            except Exception as e:
-                _LOGGER.warning("Failed to re-enable notifications: %s", e)
-            
-            # Clear old subscriptions - they're no longer valid after reconnection
-            # The notification callbacks are still registered in the client, but we need
-            # to re-fetch configurations which will re-subscribe to the correct things
-            _LOGGER.debug("Clearing old notification tokens")
-            self._root_meter_notification_token = None
-            self._battery_notification_tokens.clear()
-            self._pv_notification_tokens.clear()
-            
-            # Refresh root meter configuration and re-subscribe
-            try:
-                _LOGGER.debug("Re-fetching root meter configuration")
-                await self._update_root_meter()
-                _LOGGER.info("Root meter configuration refreshed after reconnection")
-            except Exception as e:
-                _LOGGER.warning("Failed to update root meter after reconnection: %s", e)
-            
-            # Refresh battery configurations and re-subscribe
-            try:
-                _LOGGER.debug("Re-fetching battery configurations")
-                await self._update_battery_configs()
-                _LOGGER.info("Battery configurations refreshed after reconnection (%d batteries)", len(self._battery_configs))
-            except Exception as e:
-                _LOGGER.warning("Failed to update battery configs after reconnection: %s", e)
-            
-            # Refresh PV configurations and re-subscribe
-            try:
-                _LOGGER.debug("Re-fetching PV configurations")
-                await self._update_pv_configs()
-                _LOGGER.info("PV configurations refreshed after reconnection (%d inverters)", len(self._pv_configs))
-            except Exception as e:
-                _LOGGER.warning("Failed to update PV configs after reconnection: %s", e)
-            
-            # Force a full data update to populate all sensor values
-            try:
-                _LOGGER.debug("Fetching initial data after reconnection")
-                data = await self._async_update_data()
-                if data:
-                    self.async_set_updated_data(data)
-                    _LOGGER.info("Data refresh after reconnection completed successfully - %d data points", len(data))
-                else:
-                    _LOGGER.warning("No data received during reconnection refresh")
-            except Exception as e:
-                _LOGGER.warning("Failed to update data after reconnection: %s", e)
+                if retry > 0:
+                    _LOGGER.info("Retrying reconnection refresh (attempt %d/%d)", retry + 1, max_retries)
+                    await asyncio.sleep(2.0 * retry)  # Progressive delay
                 
-        except Exception as e:
-            _LOGGER.error("Critical error during reconnection refresh: %s", e)
+                # Give the connection a moment to stabilize
+                await asyncio.sleep(2.0)
+                
+                # Verify connection is healthy before proceeding
+                try:
+                    health_check = await asyncio.wait_for(
+                        self.client.verify_connection_health(), 
+                        timeout=10.0
+                    )
+                    if not health_check:
+                        _LOGGER.warning("Connection not healthy during reconnection refresh (attempt %d)", retry + 1)
+                        if retry < max_retries - 1:
+                            continue
+                        return
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Connection health check timeout (attempt %d)", retry + 1)
+                    if retry < max_retries - 1:
+                        continue
+                    return
+                
+                _LOGGER.info("Starting full data refresh after reconnection (attempt %d)", retry + 1)
+                
+                # Re-enable notifications at JSONRPC level with retry
+                try:
+                    notify_response = await asyncio.wait_for(
+                        self.client.send_request_with_response(
+                            "JSONRPC.SetNotificationStatus", 
+                            {"namespaces": ["Energy", "Integrations"]},
+                            timeout=15.0
+                        ),
+                        timeout=20.0
+                    )
+                    if notify_response.get("status") == "success":
+                        _LOGGER.info("Notifications re-enabled after reconnection")
+                    else:
+                        _LOGGER.warning("Failed to re-enable notifications: %s", notify_response)
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout re-enabling notifications (attempt %d)", retry + 1)
+                    if retry < max_retries - 1:
+                        continue
+                except Exception as e:
+                    _LOGGER.warning("Failed to re-enable notifications (attempt %d): %s", retry + 1, e)
+                    if retry < max_retries - 1:
+                        continue
+                
+                # Clear old subscriptions - they're no longer valid after reconnection
+                # The notification callbacks are still registered in the client, but we need
+                # to re-fetch configurations which will re-subscribe to the correct things
+                _LOGGER.debug("Clearing old notification tokens")
+                self._root_meter_notification_token = None
+                self._battery_notification_tokens.clear()
+                self._pv_notification_tokens.clear()
+                
+                # Refresh root meter configuration and re-subscribe
+                try:
+                    _LOGGER.debug("Re-fetching root meter configuration")
+                    await asyncio.wait_for(self._update_root_meter(), timeout=30.0)
+                    _LOGGER.info("Root meter configuration refreshed after reconnection")
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout updating root meter after reconnection (attempt %d)", retry + 1)
+                    if retry < max_retries - 1:
+                        continue
+                except Exception as e:
+                    _LOGGER.warning("Failed to update root meter after reconnection (attempt %d): %s", retry + 1, e)
+                
+                # Refresh battery configurations and re-subscribe
+                # Use force_refresh=True to ensure states are refetched for existing batteries
+                try:
+                    _LOGGER.debug("Re-fetching battery configurations with force refresh")
+                    await asyncio.wait_for(self._update_battery_configs(force_refresh=True), timeout=30.0)
+                    _LOGGER.info("Battery configurations refreshed after reconnection (%d batteries)", len(self._battery_configs))
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout updating battery configs after reconnection (attempt %d)", retry + 1)
+                except Exception as e:
+                    _LOGGER.warning("Failed to update battery configs after reconnection (attempt %d): %s", retry + 1, e)
+                
+                # Refresh PV configurations and re-subscribe
+                # Use force_refresh=True to ensure states are refetched for existing PVs
+                try:
+                    _LOGGER.debug("Re-fetching PV configurations with force refresh")
+                    await asyncio.wait_for(self._update_pv_configs(force_refresh=True), timeout=30.0)
+                    _LOGGER.info("PV configurations refreshed after reconnection (%d inverters)", len(self._pv_configs))
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout updating PV configs after reconnection (attempt %d)", retry + 1)
+                except Exception as e:
+                    _LOGGER.warning("Failed to update PV configs after reconnection (attempt %d): %s", retry + 1, e)
+                
+                # Force a full data update to populate all sensor values
+                try:
+                    _LOGGER.debug("Fetching initial data after reconnection")
+                    data = await asyncio.wait_for(self._async_update_data(), timeout=20.0)
+                    if data:
+                        self.async_set_updated_data(data)
+                        _LOGGER.info("Data refresh after reconnection completed successfully - %d data points", len(data))
+                        break  # Success, exit retry loop
+                    else:
+                        _LOGGER.warning("No data received during reconnection refresh (attempt %d)", retry + 1)
+                        if retry < max_retries - 1:
+                            continue
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout fetching data after reconnection (attempt %d)", retry + 1)
+                    if retry < max_retries - 1:
+                        continue
+                except Exception as e:
+                    _LOGGER.warning("Failed to update data after reconnection (attempt %d): %s", retry + 1, e)
+                    if retry < max_retries - 1:
+                        continue
+                    
+            except Exception as e:
+                _LOGGER.error("Critical error during reconnection refresh (attempt %d): %s", retry + 1, e)
+                if retry < max_retries - 1:
+                    continue
+                
+        _LOGGER.info("Reconnection refresh completed")

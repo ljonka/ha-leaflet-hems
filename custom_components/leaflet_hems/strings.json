@@ -13,8 +13,8 @@
         }
       },
       "discovery_confirm": {
-        "title": "Discovered Leaflet HEMS Device",
-        "description": "A Leaflet HEMS device was discovered on your network:\n\n**Name:** {name}\n**Host:** {host}:{port}\n**UUID:** {uuid}\n\nDo you want to add this device?",
+        "title": "Leaflet HEMS - {hostname} ({uuid})",
+        "description": "A Leaflet HEMS device was discovered on your network:\n\n**Name:** {name}\n**Hostname:** {hostname}\n**Serial Number (UUID):** {uuid}\n**IP Address:** {host}:{port}\n**Server Version:** {server_version}\n\nDo you want to add this device?",
         "data": {}
       },
       "auth": {

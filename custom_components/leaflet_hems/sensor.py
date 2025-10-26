@@ -1,7 +1,9 @@
 """Sensor platform for Leaflet HEMS integration."""
 
+import asyncio
 import logging
 from typing import Any, Dict, Optional
+import homeassistant.exceptions
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -141,36 +143,30 @@ async def async_setup_entry(
 
     async_add_entities(entities, True)
 
-    # Get or create persistent tracking of added entities to prevent duplicates
-    if "added_thing_ids" not in entry_data:
-        entry_data["added_thing_ids"] = set()
-    added_thing_ids = entry_data["added_thing_ids"]
+    # Create fresh tracking set for this setup (don't persist from previous runs)
+    # This ensures sensors are recreated if the integration is reloaded
+    added_thing_ids = set()
 
     # Set up dynamic sensors for batteries and inverters
     @callback
     def _create_dynamic_sensors(async_add_entities_callback: AddEntitiesCallback):
         """Create dynamic sensors for batteries and inverters."""
+        _LOGGER.debug("Creating dynamic sensors - batteries: %s, PV: %s", 
+                     len(coordinator._battery_configs), len(coordinator._pv_configs))
         new_entities_to_add = []
-        
+
         # Create battery sensors
         for battery_id, battery_config in coordinator._battery_configs.items():
             if battery_id in added_thing_ids:
                 continue
-            
+
             battery_sensors = [
                 {"type": "batteryLevel", "name": "Battery Level"},
                 {"type": "chargingState", "name": "Charging State"},
                 {"type": "currentPower", "name": "Current Power"},
             ]
-            
+
             for sensor_config in battery_sensors:
-                # Check if this specific sensor already exists in Home Assistant
-                unique_id = f"{nymea_uuid}_battery_{battery_id}_{sensor_config['type']}"
-                entity_registry = er.async_get(hass)
-                if entity_registry.async_get_entity_id("sensor", DOMAIN, unique_id):
-                    _LOGGER.debug("Sensor %s already exists, skipping creation", unique_id)
-                    continue
-                    
                 entity = LeafletBatterySensor(
                     coordinator=coordinator,
                     config_entry=config_entry,
@@ -194,13 +190,6 @@ async def async_setup_entry(
             ]
             
             for sensor_config in inverter_sensors:
-                # Check if this specific sensor already exists in Home Assistant
-                unique_id = f"{nymea_uuid}_inverter_{pv_id}_{sensor_config['type']}"
-                entity_registry = er.async_get(hass)
-                if entity_registry.async_get_entity_id("sensor", DOMAIN, unique_id):
-                    _LOGGER.debug("Sensor %s already exists, skipping creation", unique_id)
-                    continue
-                    
                 entity = LeafletInverterSensor(
                     coordinator=coordinator,
                     config_entry=config_entry,
@@ -216,13 +205,71 @@ async def async_setup_entry(
         if new_entities_to_add:
             async_add_entities_callback(new_entities_to_add)
 
-    # Initial creation of dynamic sensors
-    _create_dynamic_sensors(async_add_entities)
+    # Initial creation of dynamic sensors - only create after initial data
+    @callback
+    def _create_sensors_after_data():
+        if not coordinator.data:
+            _LOGGER.warning("Coordinator data not available, delaying sensor creation")
+            return
+            
+        async def _create_when_ready():
+            # Verify we have battery/PV configs
+            if not coordinator._battery_configs or not coordinator._pv_configs:
+                _LOGGER.warning("Battery/PV configs not populated, retrying in 2s")
+                await asyncio.sleep(2.0)
+            _create_dynamic_sensors(async_add_entities)
 
-    # Register callback for dynamic sensor creation for newly added devices
-    config_entry.async_on_unload(
-        coordinator.async_add_listener(lambda: _create_dynamic_sensors(async_add_entities))
-    )
+        hass.async_create_task(_create_when_ready())
+
+    # Register callback for dynamic sensor creation when coordinator data is updated
+    @callback
+    def _coordinator_listener():
+        """Create sensors when coordinator updates with new battery/PV data."""
+        _LOGGER.debug("Coordinator listener triggered - checking for new battery/PV sensors...")
+        # Only create new sensors, don't try to refresh existing ones
+        _create_dynamic_sensors(async_add_entities)
+
+    # Add listener for future updates
+    coordinator.async_add_listener(_coordinator_listener)
+
+    # Wait for initial data to be available before creating sensors
+    async def _delayed_sensor_creation():
+        """Wait for coordinator to have data, then create sensors."""
+        # Wait for up to 30 seconds for data to be available
+        for _ in range(60):  # 60 * 0.5s = 30s
+            if coordinator.data and (coordinator._battery_configs or coordinator._pv_configs):
+                _LOGGER.info("Coordinator data available, creating dynamic sensors")
+                _create_dynamic_sensors(async_add_entities)
+                break
+            await asyncio.sleep(0.5)
+        else:
+            _LOGGER.warning("Timeout waiting for coordinator data, creating sensors anyway")
+            _create_dynamic_sensors(async_add_entities)
+    
+    # Clean up old voltage sensors from entity registry
+    async def _cleanup_old_voltage_sensors():
+        """Remove old voltage sensor entities from the entity registry."""
+        entity_reg = er.async_get(hass)
+        
+        # Find and remove voltage sensors
+        entities_to_remove = []
+        for entity_id, entry in entity_reg.entities.items():
+            if entry.config_entry_id == config_entry.entry_id:
+                # Check if this is a voltage sensor
+                if "_voltage" in entry.unique_id or "voltage" in entity_id:
+                    entities_to_remove.append(entity_id)
+                    _LOGGER.info("Removing old voltage sensor entity: %s", entity_id)
+        
+        # Remove the entities
+        for entity_id in entities_to_remove:
+            entity_reg.async_remove(entity_id)
+        
+        if entities_to_remove:
+            _LOGGER.info("Removed %d old voltage sensor entities", len(entities_to_remove))
+    
+    # Schedule cleanup and sensor creation
+    hass.async_create_task(_cleanup_old_voltage_sensors())
+    hass.async_create_task(_delayed_sensor_creation())
 
 
 class LeafletPowerBalanceSensor(CoordinatorEntity, SensorEntity):
@@ -268,24 +315,61 @@ class LeafletPowerBalanceSensor(CoordinatorEntity, SensorEntity):
     async def async_added_to_hass(self) -> None:
         """Run when entity is added to hass."""
         await super().async_added_to_hass()
+        # Force immediate update and write HA state
+        await self.async_update()
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity is being removed."""
         # Notifications are handled centrally by the coordinator.
         return None
 
+    async def async_update(self):
+        """Force an update and log the current state."""
+        # Call super to handle normal coordinator update
+        await super().async_update()
+        # Force state write to ensure HA gets notified
+        try:
+            self.async_write_ha_state()
+        except Exception as e:
+            _LOGGER.debug("Error writing state for %s: %s", self.name, e)
+
 
     @property
     def native_value(self):
         """Return the native value of the sensor."""
-        if self.coordinator.data and self._sensor_config["key"] in self.coordinator.data:
-            return self.coordinator.data[self._sensor_config["key"]]
+        if self.coordinator.data:
+            key = self._sensor_config["key"]
+            value = self.coordinator.data.get(key)
+            
+            # Handle both null and undefined values
+            if value is None:
+                # Attempt to get alternative casing if available
+                alt_value = self.coordinator.data.get(key.lower()) or self.coordinator.data.get(key.upper())
+                if alt_value is not None:
+                    return alt_value
+                    
+                # Log missing keys for debugging
+                available_keys = list(self.coordinator.data.keys())
+                _LOGGER.debug(
+                    "Key '%s' not found in coordinator data for sensor '%s'. Available keys: %s",
+                    key,
+                    self.name,
+                    available_keys
+                )
+                return None
+                
+            return value
+            
         return None
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        return self.coordinator.last_update_success
+        if not self.coordinator.last_update_success:
+            return False
+            
+        key = self._sensor_config["key"]
+        return key in (self.coordinator.data or {})
 
 
 class LeafletBatterySensor(CoordinatorEntity, SensorEntity):
@@ -344,17 +428,47 @@ class LeafletBatterySensor(CoordinatorEntity, SensorEntity):
     @property
     def native_value(self):
         """Return the native value of the sensor."""
-        if (self.coordinator._battery_states and 
-            self._battery_thing_id in self.coordinator._battery_states and
-            self._sensor_type in self.coordinator._battery_states[self._battery_thing_id]):
-            return self.coordinator._battery_states[self._battery_thing_id][self._sensor_type]
+        if self.coordinator.data:
+            key = f"battery_{self._battery_thing_id}_{self._sensor_type}"
+            value = self.coordinator.data.get(key)
+            
+            # Handle both null and undefined values
+            if value is None:
+                # Attempt to get alternative casing if available
+                alt_value = self.coordinator.data.get(key.lower()) or self.coordinator.data.get(key.upper())
+                if alt_value is not None:
+                    return alt_value
+                    
+                _LOGGER.debug(
+                    "Battery sensor '%s' value missing for key '%s'",
+                    self.name,
+                    key
+                )
+                return None
+                
+            return value
+            
         return None
+
+    async def async_added_to_hass(self) -> None:
+        """Run when entity is added to hass."""
+        await super().async_added_to_hass()
+        # Force immediate state write
+        self.async_write_ha_state()
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        return (self.coordinator.last_update_success and 
-                self._battery_thing_id in self.coordinator._battery_states)
+        # If coordinator hasn't successfully updated yet, mark as unavailable
+        if not self.coordinator.last_update_success:
+            return False
+        
+        # If coordinator has no data at all, mark as unavailable
+        if not self.coordinator.data:
+            return False
+            
+        key = f"battery_{self._battery_thing_id}_{self._sensor_type}"
+        return key in self.coordinator.data
 
 
 class LeafletInverterSensor(CoordinatorEntity, SensorEntity):
@@ -408,17 +522,30 @@ class LeafletInverterSensor(CoordinatorEntity, SensorEntity):
     @property
     def native_value(self):
         """Return the native value of the sensor."""
-        if (self.coordinator._pv_states and 
-            self._pv_thing_id in self.coordinator._pv_states and
-            self._sensor_type in self.coordinator._pv_states[self._pv_thing_id]):
-            return self.coordinator._pv_states[self._pv_thing_id][self._sensor_type]
+        if self.coordinator.data:
+            key = f"pv_{self._pv_thing_id}_{self._sensor_type}"
+            return self.coordinator.data.get(key)
         return None
+
+    async def async_added_to_hass(self) -> None:
+        """Run when entity is added to hass."""
+        await super().async_added_to_hass()
+        # Force immediate state write
+        self.async_write_ha_state()
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        return (self.coordinator.last_update_success and 
-                self._pv_thing_id in self.coordinator._pv_states)
+        # If coordinator hasn't successfully updated yet, mark as unavailable
+        if not self.coordinator.last_update_success:
+            return False
+        
+        # If coordinator has no data at all, mark as unavailable
+        if not self.coordinator.data:
+            return False
+        
+        key = f"pv_{self._pv_thing_id}_{self._sensor_type}"
+        return key in self.coordinator.data
 
 
 class LeafletAggregatedSensor(CoordinatorEntity, SensorEntity):
@@ -482,4 +609,13 @@ class LeafletAggregatedSensor(CoordinatorEntity, SensorEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        return self.coordinator.last_update_success
+        # If coordinator hasn't successfully updated yet, mark as unavailable
+        if not self.coordinator.last_update_success:
+            return False
+        
+        # If there's no aggregated data at all, mark as unavailable
+        if not self.coordinator._aggregated_data:
+            return False
+        
+        # Check if this specific sensor type exists in aggregated data
+        return self._sensor_type in self.coordinator._aggregated_data

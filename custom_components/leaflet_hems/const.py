@@ -40,6 +40,21 @@ HEMS_PV_REMOVED = "Hems.PvConfigurationRemoved"
 DEVICE_TYPE_BATTERY = "battery"
 DEVICE_TYPE_INVERTER = "inverter"
 
+# State type name mappings for sensors (API state type names to sensor property names)
+BATTERY_STATE_MAPPINGS = {
+    "batteryLevel": "batteryLevel",
+    "chargingState": "chargingState",
+    "currentPower": "currentPower",
+    "soc": "batteryLevel",
+    "chargeState": "chargingState",
+    "dischargeState": "chargingState"
+}
+
+INVERTER_STATE_MAPPINGS = {
+    "currentPower": "currentPower",
+    "totalEnergyProduced": "totalEnergyProduced"
+}
+
 # Discovery constants
 ZEROCONF_SERVICE_TYPE = "_jsonrpc._tcp.local."
 ZEROCONF_NYMEA_MANUFACTURER = "nymea GmbH"

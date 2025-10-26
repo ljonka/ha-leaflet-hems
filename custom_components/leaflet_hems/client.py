@@ -40,6 +40,7 @@ class NymeaClient:
         self._reconnect_delay: float = self.RECONNECT_INITIAL_DELAY
         self._is_connected: bool = False
         self._reconnection_callbacks: List[Callable[[], None]] = []
+        self._disconnection_callbacks: List[Callable[[], None]] = []
         self._session_id: Optional[str] = None
 
     async def connect(self, host: str, port: int, timeout: float = 10.0) -> None:
@@ -255,6 +256,16 @@ class NymeaClient:
         if callback in self._reconnection_callbacks:
             self._reconnection_callbacks.remove(callback)
 
+    def register_disconnection_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback to be called when disconnection is detected."""
+        if callback not in self._disconnection_callbacks:
+            self._disconnection_callbacks.append(callback)
+
+    def unregister_disconnection_callback(self, callback: Callable[[], None]) -> None:
+        """Remove a disconnection callback."""
+        if callback in self._disconnection_callbacks:
+            self._disconnection_callbacks.remove(callback)
+
     @property
     def is_connected(self) -> bool:
         """Return True if the client is connected."""
@@ -374,67 +385,122 @@ class NymeaClient:
         async with self._lock:
             if self._reconnect_task and not self._reconnect_task.done():
                 # Reconnect already in progress
+                _LOGGER.debug("Reconnection already in progress, skipping duplicate disconnect handling")
                 return
+
+            # Notify all registered disconnection callbacks
+            _LOGGER.info("Notifying %d disconnection callbacks", len(self._disconnection_callbacks))
+            for callback in self._disconnection_callbacks:
+                try:
+                    callback()
+                except Exception as e:
+                    _LOGGER.error("Error in disconnection callback: %s", e)
 
             # Clean up existing connection
             await self.close()
 
-            # Start reconnect loop
-            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+            # Only start reconnect if we have host/port configured
+            if self._host and self._port:
+                # Start reconnect loop
+                self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+            else:
+                _LOGGER.error("Cannot start reconnection: host or port not configured")
 
     async def _reconnect_loop(self) -> None:
         """Attempt to reconnect with exponential backoff."""
-        _LOGGER.info("Starting reconnection attempts...")
-        while True:
-            _LOGGER.info("Will attempt to reconnect in %s seconds...", self._reconnect_delay)
+        _LOGGER.info("Starting reconnection attempts to %s:%s", self._host, self._port)
+        attempt = 0
+        max_attempts = 100  # Prevent infinite loops, but allow many retries
+        
+        while attempt < max_attempts:
+            attempt += 1
+            _LOGGER.info("Reconnection attempt %d/%d in %s seconds...", attempt, max_attempts, self._reconnect_delay)
             await asyncio.sleep(self._reconnect_delay)
             
-            if self._host and self._port:
+            try:
+                _LOGGER.info("Attempting to reconnect to %s:%s (attempt %d)", self._host, self._port, attempt)
+                
+                # Step 1: Establish TCP connection with timeout
                 try:
-                    _LOGGER.info("Attempting to reconnect to %s:%s", self._host, self._port)
-                    await self.connect(self._host, self._port)
+                    await asyncio.wait_for(self.connect(self._host, self._port), timeout=10.0)
                     _LOGGER.info("TCP connection re-established to %s:%s", self._host, self._port)
-                    
-                    # Perform handshake after reconnection
-                    hello_params = await self.hello(timeout=15.0)
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout connecting to %s:%s (attempt %d), will retry", 
+                                   self._host, self._port, attempt)
+                    raise RuntimeError("Connection timeout")
+                
+                # Step 2: Perform handshake with extended timeout
+                try:
+                    hello_params = await asyncio.wait_for(self.hello(timeout=20.0), timeout=25.0)
                     if not hello_params:
-                        _LOGGER.warning("Hello handshake failed after reconnection, will retry")
-                        raise RuntimeError("Hello handshake failed")
-                    
-                    _LOGGER.info("Handshake successful after reconnection")
-                    
-                    # Restart reader and keepalive loops
+                        _LOGGER.warning("Hello handshake failed after reconnection (attempt %d), will retry", attempt)
+                        raise RuntimeError("Hello handshake returned None")
+                    _LOGGER.info("Handshake successful after reconnection (attempt %d)", attempt)
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout during handshake (attempt %d), will retry", attempt)
+                    raise RuntimeError("Handshake timeout")
+                
+                # Step 3: Restart reader loop
+                try:
                     await self.start_reader_loop()
                     _LOGGER.debug("Reader loop restarted after reconnection")
-                    
+                except Exception as e:
+                    _LOGGER.warning("Failed to start reader loop (attempt %d): %s, will retry", attempt, e)
+                    raise RuntimeError(f"Failed to start reader loop: {e}")
+                
+                # Step 4: Restart keepalive loop
+                try:
                     await self.start_keepalive()
                     _LOGGER.debug("Keepalive loop restarted after reconnection")
-                    
-                    self._reconnect_delay = self.RECONNECT_INITIAL_DELAY  # Reset delay
-                    
-                    # Notify all registered reconnection callbacks
-                    _LOGGER.info("Notifying %d reconnection callbacks", len(self._reconnection_callbacks))
-                    for callback in self._reconnection_callbacks:
-                        try:
-                            callback()
-                        except Exception as e:
-                            _LOGGER.error("Error in reconnection callback: %s", e)
-                    
-                    _LOGGER.info("Reconnection completed successfully")
-                    break  # Exit reconnect loop
                 except Exception as e:
-                    _LOGGER.warning("Failed to reconnect to %s:%s: %s", self._host, self._port, e)
-                    # Clean up partial connection
+                    _LOGGER.warning("Failed to start keepalive (attempt %d): %s, will retry", attempt, e)
+                    raise RuntimeError(f"Failed to start keepalive: {e}")
+                
+                # Step 5: Verify connection health before declaring success
+                try:
+                    health_check = await asyncio.wait_for(self.verify_connection_health(), timeout=10.0)
+                    if not health_check:
+                        _LOGGER.warning("Connection health check failed after reconnection (attempt %d), will retry", attempt)
+                        raise RuntimeError("Connection health check failed")
+                    _LOGGER.info("Connection health verified after reconnection")
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout during health check (attempt %d), will retry", attempt)
+                    raise RuntimeError("Health check timeout")
+                
+                # Success! Reset delay and notify callbacks
+                self._reconnect_delay = self.RECONNECT_INITIAL_DELAY
+                
+                # Notify all registered reconnection callbacks
+                _LOGGER.info("Notifying %d reconnection callbacks", len(self._reconnection_callbacks))
+                for callback in self._reconnection_callbacks:
                     try:
-                        await self.close()
-                    except Exception:
-                        pass
-                    self._reconnect_delay = min(
-                        self._reconnect_delay * 2, self.RECONNECT_MAX_DELAY
-                    )
-            else:
-                _LOGGER.error("Cannot reconnect: host or port not set.")
-                break # Cannot reconnect without host/port
+                        callback()
+                    except Exception as e:
+                        _LOGGER.error("Error in reconnection callback: %s", e)
+                
+                _LOGGER.info("Reconnection completed successfully after %d attempts", attempt)
+                break  # Exit reconnect loop
+                
+            except Exception as e:
+                _LOGGER.warning("Reconnection attempt %d failed: %s", attempt, e)
+                
+                # Clean up partial connection
+                try:
+                    await self.close()
+                except Exception as cleanup_error:
+                    _LOGGER.debug("Error during cleanup after failed reconnect: %s", cleanup_error)
+                
+                # Increase delay with exponential backoff
+                self._reconnect_delay = min(
+                    self._reconnect_delay * 2, self.RECONNECT_MAX_DELAY
+                )
+                
+                # Continue to next attempt
+                continue
+        
+        # If we exhausted all attempts
+        if attempt >= max_attempts:
+            _LOGGER.error("Reconnection failed after %d attempts, giving up", max_attempts)
 
     async def _dispatch_notification(self, notification: Dict[str, Any]) -> None:
         """Dispatch a notification to all registered callbacks."""

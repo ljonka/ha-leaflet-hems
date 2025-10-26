@@ -197,6 +197,7 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         port = parsed_info[CONF_PORT]
         uuid = parsed_info[CONF_NYMEA_UUID]
         name = parsed_info[CONF_NYMEA_NAME]
+        hostname = parsed_info.get("hostname", "")
 
         # Set unique_id and check if already configured
         await self.async_set_unique_id(uuid)
@@ -216,6 +217,14 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_NYMEA_UUID: handshake_data.get("uuid", uuid),
             CONF_NYMEA_NAME: handshake_data.get("name", name),
         })
+
+        # Set title placeholders to show unique identifying information in the discovery list
+        # This displays in the integration overview before the user clicks on the device
+        self.context["title_placeholders"] = {
+            "name": name,
+            "hostname": hostname,
+            "uuid": uuid[:8],  # Show first 8 characters of UUID for brevity
+        }
 
         # Show confirmation form to user
         return await self.async_step_discovery_confirm()
@@ -272,8 +281,10 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "name": self._discovery_info[CONF_NYMEA_NAME],
                 "host": self._discovery_info[CONF_HOST],
-                "port": self._discovery_info[CONF_PORT],
+                "port": str(self._discovery_info[CONF_PORT]),
                 "uuid": self._discovery_info[CONF_NYMEA_UUID],
+                "hostname": self._discovery_info.get("hostname", ""),
+                "server_version": self._discovery_info.get("server_version", ""),
             },
         )
 
@@ -517,6 +528,14 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             host = discovery_info.host
             port = discovery_info.port
             
+            # Extract hostname from zeroconf discovery info (the mDNS name)
+            hostname = discovery_info.hostname or discovery_info.name or ""
+            # Remove .local suffix if present
+            if hostname.endswith(".local."):
+                hostname = hostname[:-7]
+            elif hostname.endswith(".local"):
+                hostname = hostname[:-6]
+            
             # Get TXT record properties
             properties = discovery_info.properties or {}
             
@@ -552,8 +571,8 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 name = f"Leaflet HEMS ({host})"
             
             _LOGGER.info(
-                "Parsed discovery info - Host: %s, Port: %s, Name: %s, UUID: %s, Version: %s, SSL: %s",
-                host, port, name, uuid, server_version, ssl_enabled
+                "Parsed discovery info - Host: %s, Port: %s, Hostname: %s, Name: %s, UUID: %s, Version: %s, SSL: %s",
+                host, port, hostname, name, uuid, server_version, ssl_enabled
             )
             
             return {
@@ -561,6 +580,8 @@ class LeafletHEMSFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_PORT: port,
                 CONF_NYMEA_UUID: uuid,
                 CONF_NYMEA_NAME: name,
+                "hostname": hostname,
+                "server_version": server_version,
             }
             
         except Exception as e:
