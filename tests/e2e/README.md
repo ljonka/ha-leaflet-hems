@@ -42,6 +42,33 @@ Household consumption is calculated from grid, generation and storage.
 The HA Energy Dashboard calculates the same balance; the household sensors are
 available for dashboards and automations.
 
+## Mock nymea device (no real device required)
+
+`tests/fake_nymea.py` contains a full in-process mock of the nymea JSON-RPC
+API: TLS, token auth, Hello (including the id-0 quirk), filtered
+things/classes, energy balance, live notifications with notification ids,
+configuration changes and restart/reconnect support.
+
+The unit tests use it directly. It can also be run as a standalone server:
+
+```bash
+python -m tests.fake_nymea \
+    --host 0.0.0.0 --port 12222 --tls --simulate
+```
+
+It prints the mock device UUID, token, username and password. Add it to Home
+Assistant with manual setup using the printed host/port and credentials.
+`--simulate` changes PV and battery power every five seconds so the live
+power view can be tested without a Leaflet. Use `--no-auth` for an
+unauthenticated mock.
+
+This is also the recommended way to test reconnect handling without
+restarting a real nymead:
+
+```bash
+.venv/bin/pytest tests/test_mock_nymea.py -q
+```
+
 ## Discovery lifecycle helpers
 
 These helpers are useful for manual testing of mDNS discovery and add/remove:
@@ -60,3 +87,7 @@ These helpers are useful for manual testing of mDNS discovery and add/remove:
 - `tls_raw_probe.py` — raw TLS probe for the Hello/SetNotificationStatus
   sequence.
 - `tls_notification_variants.py` — compare `SetNotificationStatus` variants.
+- `hacs_check.py` — check HACS update detection for the public repository
+  (`--install` downloads the latest release). HACS must be active.
+- `add_mock_entry.py` — add the standalone mock server through the manual
+  config flow (host, port, username, password).

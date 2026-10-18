@@ -38,11 +38,22 @@ device.
 
 ### Using HACS (Recommended)
 
-1. Open HACS in your Home Assistant instance.
-2. Go to "Integrations", click the three-dot menu and add this repository as a
-   custom repository if it is not listed yet:
-   `https://github.com/ljonka/ha-leaflet-hems`.
-3. Search for "Leaflet HEMS", download it and restart Home Assistant.
+HACS is the easiest way to install the integration and receive updates.
+
+1. Make sure HACS is installed and active in Home Assistant.
+2. Open HACS, go to "Integrations", click the three-dot menu and choose
+   "Custom repositories".
+3. Add `https://github.com/ljonka/ha-leaflet-hems` with category
+   "Integration".
+4. Search for "Leaflet HEMS", open it, select version `1.0.0` or newer and
+   download it.
+5. Restart Home Assistant.
+
+HACS detects updates from GitHub releases. The repository is tagged with
+semantic versions (for example `1.0.0`) and
+`custom_components/leaflet_hems/manifest.json` carries the same version, so
+HACS compares the installed version with the latest release and offers an
+update when a newer tag exists.
 
 ### Manual Installation
 
@@ -166,6 +177,21 @@ The unit tests cover the persistent client, reconnect/backoff, keepalive,
 notification buffering, filtered snapshots, grouped data mapping, energy
 scaling/rounding, the sensor platform, the config flow and Zeroconf
 de-duplication.
+
+### Mock nymea device
+
+`tests/fake_nymea.py` models the nymea JSON-RPC API in-process, including
+TLS, token auth, the Hello id-0 requirement, filtered things/classes, energy
+balance, notifications with notification ids, configuration changes and
+restart/reconnect. The tests use it, and it can also run standalone:
+
+```bash
+python -m tests.fake_nymea --host 0.0.0.0 --port 12222 --tls --simulate
+```
+
+This allows full integration and reconnect testing without a real nymead
+instance on the network. See
+[`tests/e2e/README.md`](tests/e2e/README.md) for details.
 
 ### Live tests against Home Assistant
 
