@@ -47,7 +47,9 @@ async def test_connect_handshake_and_subscribe(server):
         hello = await client.async_connect()
         assert hello["uuid"] == "{12345678-1234-1234-1234-123456789abc}"
         assert client.is_connected
-        assert server.requests_for("JSONRPC.Hello")
+        hello_requests = server.requests_for("JSONRPC.Hello")
+        assert hello_requests
+        assert hello_requests[0]["id"] == 0, "Hello must use request id 0"
         notify = server.requests_for("JSONRPC.SetNotificationStatus")
         assert notify
         assert notify[0]["params"]["namespaces"] == [
@@ -71,6 +73,7 @@ async def test_authentication_uses_credentials_and_stores_token(server):
         assert len(server.requests_for("JSONRPC.Authenticate")) == 1
         hello_requests = server.requests_for("JSONRPC.Hello")
         assert len(hello_requests) == 2
+        assert all(request["id"] == 0 for request in hello_requests)
         assert hello_requests[1]["token"] == server.valid_token
     finally:
         await client.async_close()

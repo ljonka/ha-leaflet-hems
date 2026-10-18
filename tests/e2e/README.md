@@ -54,3 +54,9 @@ These helpers are useful for manual testing of mDNS discovery and add/remove:
 - `mdns_browse.py` — browse `_jsonrpc._tcp.local.` services.
 - `plain_notifications.py` — listen to JSON-RPC notifications on the device's
   plain local interface.
+- `tls_notify_probe.py` — verify that the integration's own TLS+token client
+  receives live notifications (`JSONRPC.Hello` must use id `0`, and nymea
+  notifications carry their own `id` field).
+- `tls_raw_probe.py` — raw TLS probe for the Hello/SetNotificationStatus
+  sequence.
+- `tls_notification_variants.py` — compare `SetNotificationStatus` variants.

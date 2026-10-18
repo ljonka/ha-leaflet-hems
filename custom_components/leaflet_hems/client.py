@@ -232,10 +232,14 @@ class NymeaClient:
     async def async_hello(self) -> dict[str, Any]:
         """Perform JSONRPC.Hello and return its params."""
 
+        # nymea requires the JSONRPC.Hello request id to be 0.  Using a
+        # different id still returns a successful Hello, but the connection
+        # is not fully initialized for server notifications.
         response = await self.request(
             RPC_HELLO_METHOD,
             {"locale": self._locale},
             include_token=self._token is not None,
+            request_id=0,
         )
         params = clean_params(response.get("params") or {})
         self.server_info = params
@@ -503,6 +507,7 @@ class NymeaClient:
         *,
         timeout: float | None = None,
         include_token: bool = True,
+        request_id: int | None = None,
     ) -> dict[str, Any]:
         """Send a JSON-RPC request and wait for the matching response."""
 
@@ -510,8 +515,9 @@ class NymeaClient:
         if writer is None or writer.is_closing() or self._disconnect_event.is_set():
             raise NymeaConnectionError("Not connected to the nymea device")
 
-        request_id = self._next_id
-        self._next_id += 1
+        if request_id is None:
+            request_id = self._next_id
+            self._next_id += 1
         payload: dict[str, Any] = {"id": request_id, "method": method}
         if params:
             payload["params"] = params
@@ -568,14 +574,20 @@ class NymeaClient:
                     _LOGGER.warning("Ignoring invalid JSON from nymea: %s", text[:200])
                     continue
 
+                # nymea notifications carry their own numeric "id" field.
+                # They must be recognized before the response-id lookup,
+                # otherwise all live updates are silently dropped.
+                if "notification" in message or (
+                    "method" in message and "status" not in message
+                ):
+                    await self._dispatch_notification(message)
+                    continue
+
                 if "id" in message:
                     future = self._pending.pop(message["id"], None)
                     if future is not None and not future.done():
                         future.set_result(message)
                     continue
-
-                if "notification" in message or "method" in message:
-                    await self._dispatch_notification(message)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

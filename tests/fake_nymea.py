@@ -34,6 +34,7 @@ class FakeNymeaServer:
         self.responses: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {}
         self.hang_methods: set[str] = set()
         self.request_event = asyncio.Event()
+        self.notification_id = 100000
 
     async def start(self) -> None:
         self.server = await asyncio.start_server(
@@ -145,8 +146,13 @@ class FakeNymeaServer:
     async def send_notification(
         self, notification: str, params: dict[str, Any]
     ) -> None:
+        self.notification_id += 1
         payload = json.dumps(
-            {"notification": notification, "params": params}
+            {
+                "id": self.notification_id,
+                "notification": notification,
+                "params": params,
+            }
         ).encode() + b"\n"
         for writer in list(self.writers):
             writer.write(payload)
