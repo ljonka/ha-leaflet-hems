@@ -58,20 +58,24 @@ async def main() -> None:
             "hacs/repository/info", repository_id=repository_id
         )
         print_repository(info)
-        assert info.get("available_version") == "1.0.0", info
+        if info.get("available_version") == info.get("installed_version"):
+            print("HACS is already up to date")
+            return
         assert info.get("pending_upgrade") is True, info
 
         if args.install:
             await ha.ws_command(
                 "hacs/repository/download",
                 repository=repository_id,
-                version="1.0.0",
+                version=info["available_version"],
             )
             info = await ha.ws_command(
                 "hacs/repository/info", repository_id=repository_id
             )
             print_repository(info)
-            assert info.get("installed_version") == "1.0.0", info
+            assert (
+                info.get("installed_version") == info.get("available_version")
+            ), info
             assert info.get("pending_upgrade") is False, info
             print("HACS UPDATE INSTALLED")
 

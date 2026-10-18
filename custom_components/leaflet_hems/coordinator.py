@@ -111,6 +111,7 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._snapshot_lock = asyncio.Lock()
         self._snapshot_semaphore = asyncio.Semaphore(SNAPSHOT_CONCURRENCY)
         self._disconnect_logged = False
+        self._last_consumption_energy: float | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -659,6 +660,15 @@ class LeafletHEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Inconsistent device counters must not make a total_increasing
             # sensor go negative.
             consumption_energy = max(0.0, consumption_energy)
+            # The value is calculated from several counters.  A source
+            # notification can arrive slightly out of order and make the
+            # derived counter dip by a few Wh.  Keep the previous value for
+            # such tiny fluctuations; allow real counter resets to pass.
+            if self._last_consumption_energy is not None:
+                drop = self._last_consumption_energy - consumption_energy
+                if 0 < drop < 0.5:
+                    consumption_energy = self._last_consumption_energy
+            self._last_consumption_energy = consumption_energy
 
         data: dict[str, Any] = {
             "grid_power": grid_power,

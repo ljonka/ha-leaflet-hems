@@ -416,3 +416,20 @@ async def test_energy_and_power_values_are_rounded(hass):
     assert coordinator.data["grid_power"] == 104.0
     assert coordinator.data["grid_import_energy"] == 22177.123
     assert coordinator.data["grid_export_energy"] == 27994.988
+
+
+@pytest.mark.asyncio
+async def test_consumption_energy_ignores_tiny_counter_dips(hass):
+    """The calculated household counter never dips by a few Wh."""
+
+    coordinator, client = make_coordinator(hass, make_responses())
+    await coordinator.async_start(first_snapshot_timeout=1)
+    initial = coordinator.data["consumption_energy"]
+
+    coordinator._states[BATTERY]["totalEnergyConsumed"] = 0.103
+    coordinator._publish(force=True)
+    assert coordinator.data["consumption_energy"] == pytest.approx(initial)
+
+    coordinator._states[BATTERY]["totalEnergyConsumed"] = 10.0
+    coordinator._publish(force=True)
+    assert coordinator.data["consumption_energy"] < initial - 5
