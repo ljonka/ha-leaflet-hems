@@ -17,7 +17,8 @@ services:
     # On macOS, Docker runs in a VM which prevents both host networking from working properly
     # AND prevents the container from reaching local network devices on the Mac's network.
     # For development, consider running Home Assistant natively (see MACOS_DOCKER_NETWORKING.md)
-    # or configure your device at 192.168.178.42 to accept connections from Docker subnet (172.x.x.x)
+    # or configure your device at its LAN address to accept connections from
+    # the Docker subnet (172.x.x.x)
 
 volumes:
   hass_config:

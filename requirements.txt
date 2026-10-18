@@ -1,6 +1,4 @@
 zeroconf
-aiohttp
-cryptography
 pytest
 pytest-asyncio
 pytest-homeassistant-custom-component

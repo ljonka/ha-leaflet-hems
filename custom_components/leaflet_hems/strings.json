@@ -3,7 +3,7 @@
     "step": {
       "manual": {
         "title": "Manual Setup",
-        "description": "Enter the connection details for your Leaflet HEMS device",
+        "description": "Enter the connection details for your Leaflet HEMS device. The integration keeps a persistent TLS connection and receives live data through JSON-RPC notifications.",
         "data": {
           "host": "Host/IP Address",
           "port": "Port",
@@ -19,7 +19,15 @@
       },
       "auth": {
         "title": "Authentication Required",
-        "description": "Enter your credentials for {name} ({host})",
+        "description": "Enter your credentials for {name} ({host}). The credentials are only used once to obtain a device token.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Leaflet HEMS",
+        "description": "The stored token for {name} ({host}) is no longer valid. Enter the credentials again to obtain a new token.",
         "data": {
           "username": "Username",
           "password": "Password"
@@ -29,7 +37,7 @@
     "error": {
       "cannot_connect": "Failed to connect to the device. Please check the host and port.",
       "invalid_auth": "Invalid username or password.",
-      "cannot_get_uuid": "Could not retrieve device UUID.",
+      "cannot_get_uuid": "Could not retrieve the device UUID.",
       "not_supported": "This device is not a supported Leaflet HEMS device.",
       "discovery_error": "An error occurred during device discovery."
     },
@@ -38,16 +46,10 @@
       "cannot_connect": "Cannot connect to device",
       "cannot_get_uuid": "Cannot get device UUID",
       "not_supported": "Device not supported",
-      "discovery_error": "Discovery error"
-    }
-  },
-  "options": {
-    "step": {
-      "init": {
-        "title": "Leaflet HEMS Options",
-        "description": "Configure options for your Leaflet HEMS device",
-        "data": {}
-      }
+      "discovery_error": "Discovery error",
+      "reauth_failed": "Reauthentication failed",
+      "reauth_successful": "Reauthentication was successful",
+      "invalid_auth": "Invalid username or password"
     }
   }
 }

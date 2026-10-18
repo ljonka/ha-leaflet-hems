@@ -1,9 +1,22 @@
-"""Sensor platform for Leaflet HEMS integration."""
+"""Grouped sensor platform for the Leaflet HEMS integration.
 
-import asyncio
+The integration deliberately exposes four grouped devices instead of one
+device per nymea thing:
+
+* Grid Connection Point: import/export power and energy
+* Generators: PV power and energy
+* Storage: charge/discharge power and charged/discharged energy
+* Household Consumption: calculated power and energy
+
+All energy sensors use ``device_class=energy``, ``state_class=total_increasing``
+and ``kWh`` so they can be selected directly in the Home Assistant Energy
+Dashboard.
+"""
+
+from __future__ import annotations
+
 import logging
-from typing import Any, Dict, Optional
-import homeassistant.exceptions
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -11,75 +24,182 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfPower, UnitOfEnergy, PERCENTAGE
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.const import UnitOfEnergy, UnitOfPower
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.helpers import entity_registry as er
 
-from .const import DOMAIN, NAME, VERSION, CONF_NYMEA_UUID, CONF_NYMEA_NAME, DEVICE_TYPE_BATTERY, DEVICE_TYPE_INVERTER
-from .client import NymeaClient
+from .const import (
+    DOMAIN,
+    GROUP_CONSUMPTION,
+    GROUP_GENERATION,
+    GROUP_GRID,
+    GROUP_STORAGE,
+    VERSION,
+)
+from .coordinator import LeafletHEMSCoordinator
+from .util import normalize_uuid
 
 _LOGGER = logging.getLogger(__name__)
 
-# Power balance sensor definitions based on dart client
-POWER_BALANCE_SENSORS = [
+_VIA_DEVICE_ID_SUPPORTED = "via_device_id" in DeviceInfo.__annotations__
+
+GROUP_DEVICES: dict[str, dict[str, str]] = {
+    GROUP_GRID: {
+        "name": "Grid Connection Point",
+        "model": "Grid Connection Point",
+        "icon": "mdi:transmission-tower",
+    },
+    GROUP_GENERATION: {
+        "name": "Generators",
+        "model": "Generators",
+        "icon": "mdi:solar-power",
+    },
+    GROUP_STORAGE: {
+        "name": "Storage",
+        "model": "Storage",
+        "icon": "mdi:battery",
+    },
+    GROUP_CONSUMPTION: {
+        "name": "Household Consumption",
+        "model": "Household Consumption",
+        "icon": "mdi:home-lightning-bolt",
+    },
+}
+
+SENSOR_DEFINITIONS: list[dict[str, Any]] = [
     {
-        "key": "currentPowerConsumption",
-        "name": "Current Power Consumption",
+        "key": "grid_import_power",
+        "group": GROUP_GRID,
+        "name": "Grid Import Power",
         "device_class": SensorDeviceClass.POWER,
         "unit": UnitOfPower.WATT,
         "state_class": SensorStateClass.MEASUREMENT,
+        "icon": "mdi:transmission-tower-import",
+        "precision": 0,
     },
     {
-        "key": "currentPowerProduction", 
-        "name": "Current Power Production",
+        "key": "grid_export_power",
+        "group": GROUP_GRID,
+        "name": "Grid Export Power",
         "device_class": SensorDeviceClass.POWER,
         "unit": UnitOfPower.WATT,
         "state_class": SensorStateClass.MEASUREMENT,
+        "icon": "mdi:transmission-tower-export",
+        "precision": 0,
     },
     {
-        "key": "currentPowerAcquisition",
-        "name": "Current Power Acquisition",
+        "key": "grid_import_energy",
+        "group": GROUP_GRID,
+        "name": "Grid Import Energy",
+        "device_class": SensorDeviceClass.ENERGY,
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "icon": "mdi:transmission-tower-import",
+        "precision": 2,
+    },
+    {
+        "key": "grid_export_energy",
+        "group": GROUP_GRID,
+        "name": "Grid Export Energy",
+        "device_class": SensorDeviceClass.ENERGY,
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "icon": "mdi:transmission-tower-export",
+        "precision": 2,
+    },
+    {
+        "key": "generation_power",
+        "group": GROUP_GENERATION,
+        "name": "Generation Power",
         "device_class": SensorDeviceClass.POWER,
         "unit": UnitOfPower.WATT,
         "state_class": SensorStateClass.MEASUREMENT,
+        "icon": "mdi:solar-power",
+        "precision": 0,
     },
     {
-        "key": "currentPowerStorage",
-        "name": "Current Power Storage",
+        "key": "generation_energy",
+        "group": GROUP_GENERATION,
+        "name": "Generation Energy",
+        "device_class": SensorDeviceClass.ENERGY,
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "icon": "mdi:solar-panel",
+        "precision": 2,
+    },
+    {
+        "key": "storage_power",
+        "group": GROUP_STORAGE,
+        "name": "Storage Power",
         "device_class": SensorDeviceClass.POWER,
         "unit": UnitOfPower.WATT,
         "state_class": SensorStateClass.MEASUREMENT,
+        "icon": "mdi:battery-charging",
+        "precision": 0,
     },
     {
-        "key": "totalConsumption",
-        "name": "Total Consumption",
-        "device_class": SensorDeviceClass.ENERGY,
-        "unit": UnitOfEnergy.KILO_WATT_HOUR,
-        "state_class": SensorStateClass.TOTAL,
+        "key": "storage_charging_power",
+        "group": GROUP_STORAGE,
+        "name": "Storage Charging Power",
+        "device_class": SensorDeviceClass.POWER,
+        "unit": UnitOfPower.WATT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "icon": "mdi:battery-plus",
+        "precision": 0,
     },
     {
-        "key": "totalProduction", 
-        "name": "Total Production",
-        "device_class": SensorDeviceClass.ENERGY,
-        "unit": UnitOfEnergy.KILO_WATT_HOUR,
-        "state_class": SensorStateClass.TOTAL,
+        "key": "storage_discharging_power",
+        "group": GROUP_STORAGE,
+        "name": "Storage Discharging Power",
+        "device_class": SensorDeviceClass.POWER,
+        "unit": UnitOfPower.WATT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "icon": "mdi:battery-minus",
+        "precision": 0,
     },
     {
-        "key": "totalAcquisition",
-        "name": "Total Acquisition", 
+        "key": "storage_energy_stored",
+        "group": GROUP_STORAGE,
+        "name": "Storage Energy Stored",
         "device_class": SensorDeviceClass.ENERGY,
         "unit": UnitOfEnergy.KILO_WATT_HOUR,
-        "state_class": SensorStateClass.TOTAL,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "icon": "mdi:battery-plus",
+        "precision": 2,
     },
     {
-        "key": "totalReturn",
-        "name": "Total Return",
+        "key": "storage_energy_provided",
+        "group": GROUP_STORAGE,
+        "name": "Storage Energy Provided",
         "device_class": SensorDeviceClass.ENERGY,
         "unit": UnitOfEnergy.KILO_WATT_HOUR,
-        "state_class": SensorStateClass.TOTAL,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "icon": "mdi:battery-minus",
+        "precision": 2,
+    },
+    {
+        "key": "consumption_power",
+        "group": GROUP_CONSUMPTION,
+        "name": "Household Consumption Power",
+        "device_class": SensorDeviceClass.POWER,
+        "unit": UnitOfPower.WATT,
+        "state_class": SensorStateClass.MEASUREMENT,
+        "icon": "mdi:home-lightning-bolt",
+        "precision": 0,
+    },
+    {
+        "key": "consumption_energy",
+        "group": GROUP_CONSUMPTION,
+        "name": "Household Consumption Energy",
+        "device_class": SensorDeviceClass.ENERGY,
+        "unit": UnitOfEnergy.KILO_WATT_HOUR,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "icon": "mdi:home-lightning-bolt",
+        "precision": 2,
     },
 ]
 
@@ -89,533 +209,145 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Leaflet HEMS sensor entities."""
+    """Set up the grouped Leaflet HEMS sensors."""
+
     entry_data = hass.data[DOMAIN][config_entry.entry_id]
-    coordinator = entry_data["coordinator"]
-    client: NymeaClient = entry_data["client"]
-    nymea_uuid = entry_data["uuid"]
-    nymea_name = entry_data["name"]
-    notifications_enabled = entry_data.get("notifications_enabled", False)
+    coordinator: LeafletHEMSCoordinator = entry_data["coordinator"]
+    nymea_uuid: str = entry_data["uuid"]
+    nymea_name: str = entry_data["name"]
+    base_device_id: str | None = entry_data.get("device_id")
+    if base_device_id is None:
+        device = dr.async_get(hass).async_get_device(
+            identifiers={(DOMAIN, nymea_uuid)}
+        )
+        base_device_id = device.id if device else None
 
-    # Fetch initial data
-    await coordinator.async_config_entry_first_refresh()
+    await _async_cleanup_legacy_entries(hass, config_entry, nymea_uuid)
 
-    # Create sensor entities for power balance data
-    entities = []
-    for sensor_config in POWER_BALANCE_SENSORS:
-        entity = LeafletPowerBalanceSensor(
+    entities = [
+        LeafletGroupSensor(
             coordinator=coordinator,
-            client=client,
             config_entry=config_entry,
             nymea_uuid=nymea_uuid,
             nymea_name=nymea_name,
-            sensor_config=sensor_config,
-            notifications_enabled=notifications_enabled,
+            definition=definition,
+            base_device_id=base_device_id,
         )
-        entities.append(entity)
-
-    # Create aggregated group sensors
-    aggregated_sensors = [
-        {
-            "type": "inverter_group_current_power",
-            "name": "Inverter Group Current Power",
-        },
-        {
-            "type": "inverter_group_total_energy",
-            "name": "Inverter Group Total Energy",
-        },
-        {
-            "type": "battery_group_current_power", 
-            "name": "Battery Group Current Power",
-        },
+        for definition in SENSOR_DEFINITIONS
     ]
-    
-    for sensor_config in aggregated_sensors:
-        entity = LeafletAggregatedSensor(
-            coordinator=coordinator,
-            config_entry=config_entry,
-            nymea_uuid=nymea_uuid,
-            nymea_name=nymea_name,
-            sensor_type=sensor_config["type"],
-            sensor_name=sensor_config["name"],
-        )
-        entities.append(entity)
+    async_add_entities(entities)
 
-    async_add_entities(entities, True)
 
-    # Create fresh tracking set for this setup (don't persist from previous runs)
-    # This ensures sensors are recreated if the integration is reloaded
-    added_thing_ids = set()
+class LeafletGroupSensor(CoordinatorEntity[LeafletHEMSCoordinator], SensorEntity):
+    """A sensor belonging to one of the four grouped devices."""
 
-    # Set up dynamic sensors for batteries and inverters
-    @callback
-    def _create_dynamic_sensors(async_add_entities_callback: AddEntitiesCallback):
-        """Create dynamic sensors for batteries and inverters."""
-        _LOGGER.debug("Creating dynamic sensors - batteries: %s, PV: %s", 
-                     len(coordinator._battery_configs), len(coordinator._pv_configs))
-        new_entities_to_add = []
+    _attr_has_entity_name = True
 
-        # Create battery sensors
-        for battery_id, battery_config in coordinator._battery_configs.items():
-            if battery_id in added_thing_ids:
-                continue
+    def __init__(
+        self,
+        coordinator: LeafletHEMSCoordinator,
+        config_entry: ConfigEntry,
+        nymea_uuid: str,
+        nymea_name: str,
+        definition: dict[str, Any],
+        base_device_id: str | None = None,
+    ) -> None:
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        self._nymea_uuid = nymea_uuid
+        self._nymea_name = nymea_name
+        self._definition = definition
+        self._key: str = definition["key"]
 
-            battery_sensors = [
-                {"type": "batteryLevel", "name": "Battery Level"},
-                {"type": "chargingState", "name": "Charging State"},
-                {"type": "currentPower", "name": "Current Power"},
-            ]
+        self._attr_name = definition["name"]
+        self._attr_unique_id = f"{nymea_uuid}_{self._key}"
+        self._attr_device_class = definition["device_class"]
+        self._attr_native_unit_of_measurement = definition["unit"]
+        self._attr_state_class = definition["state_class"]
+        self._attr_icon = definition["icon"]
+        self._attr_suggested_display_precision = definition["precision"]
 
-            for sensor_config in battery_sensors:
-                entity = LeafletBatterySensor(
-                    coordinator=coordinator,
-                    config_entry=config_entry,
-                    nymea_uuid=nymea_uuid,
-                    nymea_name=nymea_name,
-                    battery_thing_id=battery_id,
-                    sensor_type=sensor_config["type"],
-                    sensor_name=sensor_config["name"],
-                )
-                new_entities_to_add.append(entity)
-            added_thing_ids.add(battery_id)
-        
-        # Create inverter sensors
-        for pv_id, pv_config in coordinator._pv_configs.items():
-            if pv_id in added_thing_ids:
-                continue
-
-            inverter_sensors = [
-                {"type": "currentPower", "name": "Current Power"},
-                {"type": "totalEnergyProduced", "name": "Total Energy Produced"},
-            ]
-            
-            for sensor_config in inverter_sensors:
-                entity = LeafletInverterSensor(
-                    coordinator=coordinator,
-                    config_entry=config_entry,
-                    nymea_uuid=nymea_uuid,
-                    nymea_name=nymea_name,
-                    pv_thing_id=pv_id,
-                    sensor_type=sensor_config["type"],
-                    sensor_name=sensor_config["name"],
-                )
-                new_entities_to_add.append(entity)
-            added_thing_ids.add(pv_id)
-        
-        if new_entities_to_add:
-            async_add_entities_callback(new_entities_to_add)
-
-    # Initial creation of dynamic sensors - only create after initial data
-    @callback
-    def _create_sensors_after_data():
-        if not coordinator.data:
-            _LOGGER.warning("Coordinator data not available, delaying sensor creation")
-            return
-            
-        async def _create_when_ready():
-            # Verify we have battery/PV configs
-            if not coordinator._battery_configs or not coordinator._pv_configs:
-                _LOGGER.warning("Battery/PV configs not populated, retrying in 2s")
-                await asyncio.sleep(2.0)
-            _create_dynamic_sensors(async_add_entities)
-
-        hass.async_create_task(_create_when_ready())
-
-    # Register callback for dynamic sensor creation when coordinator data is updated
-    @callback
-    def _coordinator_listener():
-        """Create sensors when coordinator updates with new battery/PV data."""
-        _LOGGER.debug("Coordinator listener triggered - checking for new battery/PV sensors...")
-        # Only create new sensors, don't try to refresh existing ones
-        _create_dynamic_sensors(async_add_entities)
-
-    # Add listener for future updates
-    coordinator.async_add_listener(_coordinator_listener)
-
-    # Wait for initial data to be available before creating sensors
-    async def _delayed_sensor_creation():
-        """Wait for coordinator to have data, then create sensors."""
-        # Wait for up to 30 seconds for data to be available
-        for _ in range(60):  # 60 * 0.5s = 30s
-            if coordinator.data and (coordinator._battery_configs or coordinator._pv_configs):
-                _LOGGER.info("Coordinator data available, creating dynamic sensors")
-                _create_dynamic_sensors(async_add_entities)
-                break
-            await asyncio.sleep(0.5)
+        group = definition["group"]
+        group_info = GROUP_DEVICES[group]
+        device_info: dict[str, Any] = {
+            "identifiers": {(DOMAIN, f"{nymea_uuid}_{group}")},
+            "name": f"{nymea_name} {group_info['name']}",
+            "manufacturer": "Consolinno Energy GmbH",
+            "model": group_info["model"],
+            "sw_version": VERSION,
+        }
+        if base_device_id and _VIA_DEVICE_ID_SUPPORTED:
+            device_info["via_device_id"] = base_device_id
         else:
-            _LOGGER.warning("Timeout waiting for coordinator data, creating sensors anyway")
-            _create_dynamic_sensors(async_add_entities)
-    
-    # Clean up old voltage sensors from entity registry
-    async def _cleanup_old_voltage_sensors():
-        """Remove old voltage sensor entities from the entity registry."""
-        entity_reg = er.async_get(hass)
-        
-        # Find and remove voltage sensors
-        entities_to_remove = []
-        for entity_id, entry in entity_reg.entities.items():
-            if entry.config_entry_id == config_entry.entry_id:
-                # Check if this is a voltage sensor
-                if "_voltage" in entry.unique_id or "voltage" in entity_id:
-                    entities_to_remove.append(entity_id)
-                    _LOGGER.info("Removing old voltage sensor entity: %s", entity_id)
-        
-        # Remove the entities
-        for entity_id in entities_to_remove:
-            entity_reg.async_remove(entity_id)
-        
-        if entities_to_remove:
-            _LOGGER.info("Removed %d old voltage sensor entities", len(entities_to_remove))
-    
-    # Schedule cleanup and sensor creation
-    hass.async_create_task(_cleanup_old_voltage_sensors())
-    hass.async_create_task(_delayed_sensor_creation())
+            device_info["via_device"] = (DOMAIN, nymea_uuid)
+        self._attr_device_info = DeviceInfo(**device_info)
 
+    @property
+    def native_value(self) -> float | None:
+        """Return the current grouped value."""
 
-class LeafletPowerBalanceSensor(CoordinatorEntity, SensorEntity):
-    """Sensor for Leaflet HEMS power balance data."""
-
-    def __init__(
-        self,
-        coordinator,
-        client: NymeaClient,
-        config_entry: ConfigEntry,
-        nymea_uuid: str,
-        nymea_name: str,
-        sensor_config: Dict[str, Any],
-        notifications_enabled: bool,
-    ) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator)
-        self._client = client
-        self._config_entry = config_entry
-        self._nymea_uuid = nymea_uuid
-        self._nymea_name = nymea_name
-        self._sensor_config = sensor_config
-        self._notifications_enabled = notifications_enabled
-        self._notification_token: Optional[str] = None
-        
-        # Sensor attributes
-        self._attr_name = f"{nymea_name} {sensor_config['name']}"
-        self._attr_unique_id = f"{nymea_uuid}_{sensor_config['key']}"
-        self._attr_device_class = sensor_config["device_class"]
-        self._attr_native_unit_of_measurement = sensor_config["unit"]
-        self._attr_state_class = sensor_config["state_class"]
-        self._attr_icon = "mdi:flash" if "Power" in sensor_config["name"] else "mdi:lightning-bolt"
-        
-        # Device info
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, nymea_uuid)},
-            name=nymea_name,
-            manufacturer="Consolinno",
-            model="Leaflet HEMS",
-            sw_version=VERSION,
-        )
-
-    async def async_added_to_hass(self) -> None:
-        """Run when entity is added to hass."""
-        await super().async_added_to_hass()
-        # Force immediate update and write HA state
-        await self.async_update()
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Run when entity is being removed."""
-        # Notifications are handled centrally by the coordinator.
-        return None
-
-    async def async_update(self):
-        """Force an update and log the current state."""
-        # Call super to handle normal coordinator update
-        await super().async_update()
-        # Force state write to ensure HA gets notified
+        value = (self.coordinator.data or {}).get(self._key)
+        if value is None:
+            return None
         try:
-            self.async_write_ha_state()
-        except Exception as e:
-            _LOGGER.debug("Error writing state for %s: %s", self.name, e)
-
-
-    @property
-    def native_value(self):
-        """Return the native value of the sensor."""
-        if self.coordinator.data:
-            key = self._sensor_config["key"]
-            value = self.coordinator.data.get(key)
-            
-            # Handle both null and undefined values
-            if value is None:
-                # Attempt to get alternative casing if available
-                alt_value = self.coordinator.data.get(key.lower()) or self.coordinator.data.get(key.upper())
-                if alt_value is not None:
-                    return alt_value
-                    
-                # Log missing keys for debugging
-                available_keys = list(self.coordinator.data.keys())
-                _LOGGER.debug(
-                    "Key '%s' not found in coordinator data for sensor '%s'. Available keys: %s",
-                    key,
-                    self.name,
-                    available_keys
-                )
-                return None
-                
-            return value
-            
-        return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @property
     def available(self) -> bool:
-        """Return if entity is available."""
-        if not self.coordinator.last_update_success:
-            return False
-            
-        key = self._sensor_config["key"]
-        return key in (self.coordinator.data or {})
+        """Only report available when the coordinator has a live value."""
 
-
-class LeafletBatterySensor(CoordinatorEntity, SensorEntity):
-    """Sensor for Leaflet HEMS battery data."""
-
-    def __init__(
-        self,
-        coordinator,
-        config_entry: ConfigEntry,
-        nymea_uuid: str,
-        nymea_name: str,
-        battery_thing_id: str,
-        sensor_type: str,
-        sensor_name: str,
-    ) -> None:
-        """Initialize the battery sensor."""
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        self._nymea_uuid = nymea_uuid
-        self._nymea_name = nymea_name
-        self._battery_thing_id = battery_thing_id
-        self._sensor_type = sensor_type
-        self._sensor_name = sensor_name
-        
-        # Sensor attributes
-        self._attr_name = f"{nymea_name} Battery {battery_thing_id[-8:]} {sensor_name}"
-        self._attr_unique_id = f"{nymea_uuid}_battery_{battery_thing_id}_{sensor_type}"
-        
-        # Set device class and unit based on sensor type
-        if sensor_type == "batteryLevel":
-            self._attr_device_class = SensorDeviceClass.BATTERY
-            self._attr_native_unit_of_measurement = PERCENTAGE
-            self._attr_state_class = SensorStateClass.MEASUREMENT
-            self._attr_icon = "mdi:battery"
-        elif sensor_type == "chargingState":
-            self._attr_device_class = None
-            self._attr_native_unit_of_measurement = None
-            self._attr_state_class = None
-            self._attr_icon = "mdi:battery-charging"
-        elif sensor_type == "currentPower":
-            self._attr_device_class = SensorDeviceClass.POWER
-            self._attr_native_unit_of_measurement = UnitOfPower.WATT
-            self._attr_state_class = SensorStateClass.MEASUREMENT
-            self._attr_icon = "mdi:flash"
-        
-        # Device info
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{nymea_uuid}_battery_{battery_thing_id}")},
-            name=f"{nymea_name} Battery {battery_thing_id[-8:]}",
-            manufacturer="Consolinno",
-            model="Battery",
-            sw_version=VERSION,
-            via_device=(DOMAIN, nymea_uuid),
+        return (
+            self.coordinator.last_update_success
+            and (self.coordinator.data or {}).get(self._key) is not None
         )
 
-    @property
-    def native_value(self):
-        """Return the native value of the sensor."""
-        if self.coordinator.data:
-            key = f"battery_{self._battery_thing_id}_{self._sensor_type}"
-            value = self.coordinator.data.get(key)
-            
-            # Handle both null and undefined values
-            if value is None:
-                # Attempt to get alternative casing if available
-                alt_value = self.coordinator.data.get(key.lower()) or self.coordinator.data.get(key.upper())
-                if alt_value is not None:
-                    return alt_value
-                    
-                _LOGGER.debug(
-                    "Battery sensor '%s' value missing for key '%s'",
-                    self.name,
-                    key
-                )
-                return None
-                
-            return value
-            
-        return None
 
-    async def async_added_to_hass(self) -> None:
-        """Run when entity is added to hass."""
-        await super().async_added_to_hass()
-        # Force immediate state write
-        self.async_write_ha_state()
+async def _async_cleanup_legacy_entries(
+    hass: HomeAssistant, config_entry: ConfigEntry, nymea_uuid: str
+) -> None:
+    """Remove per-thing entities and devices created by older versions.
 
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-        # If coordinator hasn't successfully updated yet, mark as unavailable
-        if not self.coordinator.last_update_success:
-            return False
-        
-        # If coordinator has no data at all, mark as unavailable
-        if not self.coordinator.data:
-            return False
-            
-        key = f"battery_{self._battery_thing_id}_{self._sensor_type}"
-        return key in self.coordinator.data
+    Older releases created ``battery_<thing>_<state>`` and
+    ``inverter_<thing>_<state>`` entities.  They are replaced by the four
+    grouped devices.  Removing the stale registry entries avoids hundreds of
+    unavailable entities after an upgrade.
+    """
 
+    valid_unique_ids = {
+        f"{nymea_uuid}_{definition['key']}" for definition in SENSOR_DEFINITIONS
+    }
+    entity_registry = er.async_get(hass)
+    for entity in list(entity_registry.entities.values()):
+        if entity.config_entry_id != config_entry.entry_id:
+            continue
+        if entity.unique_id in valid_unique_ids:
+            continue
+        uuid_prefix = normalize_uuid(entity.unique_id.split("_", 1)[0])
+        if uuid_prefix == nymea_uuid:
+            _LOGGER.info("Removing legacy Leaflet HEMS entity %s", entity.entity_id)
+            entity_registry.async_remove(entity.entity_id)
 
-class LeafletInverterSensor(CoordinatorEntity, SensorEntity):
-    """Sensor for Leaflet HEMS inverter data."""
-
-    def __init__(
-        self,
-        coordinator,
-        config_entry: ConfigEntry,
-        nymea_uuid: str,
-        nymea_name: str,
-        pv_thing_id: str,
-        sensor_type: str,
-        sensor_name: str,
-    ) -> None:
-        """Initialize the inverter sensor."""
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        self._nymea_uuid = nymea_uuid
-        self._nymea_name = nymea_name
-        self._pv_thing_id = pv_thing_id
-        self._sensor_type = sensor_type
-        self._sensor_name = sensor_name
-        
-        # Sensor attributes
-        self._attr_name = f"{nymea_name} Inverter {pv_thing_id[-8:]} {sensor_name}"
-        self._attr_unique_id = f"{nymea_uuid}_inverter_{pv_thing_id}_{sensor_type}"
-        
-        # Set device class and unit based on sensor type
-        if sensor_type == "currentPower":
-            self._attr_device_class = SensorDeviceClass.POWER
-            self._attr_native_unit_of_measurement = UnitOfPower.WATT
-            self._attr_state_class = SensorStateClass.MEASUREMENT
-            self._attr_icon = "mdi:solar-power"
-        elif sensor_type == "totalEnergyProduced":
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-            self._attr_state_class = SensorStateClass.TOTAL_INCREASING
-            self._attr_icon = "mdi:solar-panel"
-        
-        # Device info
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{nymea_uuid}_inverter_{pv_thing_id}")},
-            name=f"{nymea_name} Inverter {pv_thing_id[-8:]}",
-            manufacturer="Consolinno",
-            model="Inverter",
-            sw_version=VERSION,
-            via_device=(DOMAIN, nymea_uuid),
-        )
-
-    @property
-    def native_value(self):
-        """Return the native value of the sensor."""
-        if self.coordinator.data:
-            key = f"pv_{self._pv_thing_id}_{self._sensor_type}"
-            return self.coordinator.data.get(key)
-        return None
-
-    async def async_added_to_hass(self) -> None:
-        """Run when entity is added to hass."""
-        await super().async_added_to_hass()
-        # Force immediate state write
-        self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-        # If coordinator hasn't successfully updated yet, mark as unavailable
-        if not self.coordinator.last_update_success:
-            return False
-        
-        # If coordinator has no data at all, mark as unavailable
-        if not self.coordinator.data:
-            return False
-        
-        key = f"pv_{self._pv_thing_id}_{self._sensor_type}"
-        return key in self.coordinator.data
-
-
-class LeafletAggregatedSensor(CoordinatorEntity, SensorEntity):
-    """Sensor for Leaflet HEMS aggregated data."""
-
-    def __init__(
-        self,
-        coordinator,
-        config_entry: ConfigEntry,
-        nymea_uuid: str,
-        nymea_name: str,
-        sensor_type: str,
-        sensor_name: str,
-    ) -> None:
-        """Initialize the aggregated sensor."""
-        super().__init__(coordinator)
-        self._config_entry = config_entry
-        self._nymea_uuid = nymea_uuid
-        self._nymea_name = nymea_name
-        self._sensor_type = sensor_type
-        self._sensor_name = sensor_name
-        
-        # Sensor attributes
-        self._attr_name = f"{nymea_name} {sensor_name}"
-        self._attr_unique_id = f"{nymea_uuid}_{sensor_type}"
-        
-        # Set device class and unit based on sensor type
-        if sensor_type == "inverter_group_current_power":
-            self._attr_device_class = SensorDeviceClass.POWER
-            self._attr_native_unit_of_measurement = UnitOfPower.WATT
-            self._attr_state_class = SensorStateClass.MEASUREMENT
-            self._attr_icon = "mdi:solar-power"
-        elif sensor_type == "inverter_group_total_energy":
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-            self._attr_state_class = SensorStateClass.TOTAL_INCREASING
-            self._attr_icon = "mdi:solar-panel"
-        elif sensor_type == "battery_group_current_power":
-            self._attr_device_class = SensorDeviceClass.POWER
-            self._attr_native_unit_of_measurement = UnitOfPower.WATT
-            self._attr_state_class = SensorStateClass.MEASUREMENT
-            self._attr_icon = "mdi:battery"
-        
-        # Device info
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, nymea_uuid)},
-            name=nymea_name,
-            manufacturer="Consolinno",
-            model="Leaflet HEMS",
-            sw_version=VERSION,
-        )
-
-    @property
-    def native_value(self):
-        """Return the native value of the sensor."""
-        if (self.coordinator._aggregated_data and 
-            self._sensor_type in self.coordinator._aggregated_data):
-            return self.coordinator._aggregated_data[self._sensor_type]
-        return None
-
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-        # If coordinator hasn't successfully updated yet, mark as unavailable
-        if not self.coordinator.last_update_success:
-            return False
-        
-        # If there's no aggregated data at all, mark as unavailable
-        if not self.coordinator._aggregated_data:
-            return False
-        
-        # Check if this specific sensor type exists in aggregated data
-        return self._sensor_type in self.coordinator._aggregated_data
+    device_registry = dr.async_get(hass)
+    legacy_base_identifier = (DOMAIN, f"{{{nymea_uuid}}}")
+    for device in dr.async_entries_for_config_entry(
+        device_registry, config_entry.entry_id
+    ):
+        identifiers = {
+            identifier
+            for identifier in device.identifiers
+            if identifier[0] == DOMAIN
+        }
+        legacy_device = legacy_base_identifier in identifiers
+        if not legacy_device:
+            for _domain, identifier in identifiers:
+                identifier_uuid, _, suffix = identifier.partition("_")
+                if normalize_uuid(identifier_uuid) != nymea_uuid:
+                    continue
+                if suffix.startswith(("battery_", "inverter_")):
+                    legacy_device = True
+                    break
+        if legacy_device:
+            _LOGGER.info("Removing legacy Leaflet HEMS device %s", device.name)
+            device_registry.async_remove_device(device.id)

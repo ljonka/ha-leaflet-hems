@@ -4,210 +4,201 @@
 
 Consolinno Energy GmbH — Integration "Leaflet HEMS"
 
-This integration connects Home Assistant to Consolinno Leaflet HEMS (Heim Energie Management System) devices, which are based on the nymea framework. It allows you to monitor energy data such as grid consumption, PV generation, battery status, and more.
+This integration connects Home Assistant to Consolinno Leaflet HEMS
+(Heim Energie Management System) devices, which are based on the nymea
+framework. It exposes the electricity data needed by the Home Assistant
+Energy Dashboard and keeps a persistent, event-driven connection to the
+device.
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=ljonka&repository=ha-leaflet-hems&category=integration)
 
 ## Features
 
-- **Automatic Discovery**: Uses mDNS/Zeroconf to automatically discover Leaflet HEMS devices on your network via the `_jsonrpc._tcp.local.` service type.
-- **Easy Setup**: Simple username and password authentication for discovered devices.
-- **Secure Connection**: Connects to the nymea device using TLS/JSON-RPC on port 2222.
-- **Device Validation**: Validates discovered devices to ensure they are genuine nymea-based Leaflet HEMS devices.
-- **Device Information**: Displays device name, UUID, and version.
-- **Comprehensive Sensor Integration**: Automatically creates sensors for all available energy management components:
-    - Grid Connection Meter (Root Meter): Grid consumption and feed-in
-    - Inverters: PV generation and performance
-    - Batteries: Charge level, power flow, and status
-    - Additional energy management devices as available
+- **Automatic Discovery**: mDNS/Zeroconf discovery via
+  `_jsonrpc._tcp.local.` including device name, UUID and server version.
+- **Secure persistent connection**: TLS + token authentication on port
+  `2222`, using the nymea JSON-RPC protocol.
+- **Event-driven updates**: the integration subscribes to
+  `Energy.PowerBalanceChanged`, `Integrations.StateChanged`,
+  `Energy.RootMeterChanged` and the `Hems.*Configuration*` notifications.
+  Normal operation does not poll.
+- **Compact startup snapshot**: only the configured root meter, PV and
+  battery things are loaded, and thing classes are requested with a
+  `thingClassIds` filter. Heavy unfiltered `GetThings` / `GetThingClasses`
+  calls are never repeated periodically.
+- **Reconnect handling**: exponential backoff with jitter, automatic
+  re-authentication, notification re-subscription and a fresh snapshot after
+  every reconnect. A token rejection starts the Home Assistant reauth flow.
+- **Grouped entities**: four devices instead of one device per nymea thing.
+- **Energy Dashboard ready**: grid import/export, PV generation and battery
+  charge/discharge energy sensors with `device_class=energy`,
+  `state_class=total_increasing` and `kWh`.
 
 ## Installation
 
 ### Using HACS (Recommended)
 
-1.  Open HACS in your Home Assistant instance.
-2.  Go to the "Integrations" tab.
-3.  Click the "+ EXPLORE & ADD ADD-ONS" button.
-4.  Search for "Leaflet HEMS".
-5.  Select the integration and click "Download".
-6.  Restart Home Assistant.
+1. Open HACS in your Home Assistant instance.
+2. Go to "Integrations", click the three-dot menu and add this repository as a
+   custom repository if it is not listed yet:
+   `https://github.com/ljonka/ha-leaflet-hems`.
+3. Search for "Leaflet HEMS", download it and restart Home Assistant.
 
 ### Manual Installation
 
-1.  Navigate to the `custom_components` directory of your Home Assistant installation.
-2.  If the `custom_components` directory does not exist, create it.
-3.  Download this repository or extract its contents into a `leaflet_hems` subdirectory within `custom_components`.
-    Your final directory structure should look like this:
-    ```
-    your_home_assistant_config/
-    ├── custom_components/
-    │   └── leaflet_hems/
-    │       ├── __init__.py
-    │       ├── config_flow.py
-    │       ├── const.py
-    │       ├── manifest.json
-    │       └── ... (other files)
-    ├── tests/
-    └── ...
-    ```
-4.  Restart Home Assistant.
+Copy `custom_components/leaflet_hems` into the `custom_components` directory
+of your Home Assistant configuration and restart Home Assistant.
 
 ## Configuration
 
-### Automatic Discovery Setup
+### Automatic Discovery
 
-1.  In the Home Assistant UI, go to "Settings" > "Devices & Services".
-2.  Click the "+ Add Integration" button in the bottom right corner.
-3.  Search for "Leaflet HEMS" and select it.
-4.  The integration will automatically scan your network and display any discovered Leaflet HEMS devices.
-5.  Select your device from the list and click "Submit".
-6.  Enter your username and password when prompted.
-7.  Once authenticated, the integration will automatically initialize all available sensors for your energy management system.
+1. Go to "Settings" > "Devices & Services" > "Add Integration".
+2. Search for "Leaflet HEMS". Discovered Leaflet devices are shown with their
+   name, hostname and UUID.
+3. Select the device, confirm it and enter the device username/password when
+   authentication is required.
 
-### Manual Setup (Alternative)
+The credentials are only used once to obtain a device token. The password is
+not stored.
 
-If your device is not found via automatic discovery, you can add it manually:
+### Manual Setup
 
-1.  Follow steps 1-3 above.
-2.  Instead of selecting from discovered devices, choose "Configure manually".
-3.  Enter the device's IP address and port (default: 2222).
-4.  Provide your username and password when prompted.
+If mDNS is not available, choose "Leaflet HEMS" and enter the device IP
+address and port (default `2222`), then the username/password if required.
 
-### Device Management
+### Reauthentication
 
-- Added devices will appear under "Settings" > "Devices & Services".
-- Each device will be registered with its unique UUID.
-- You can remove or reconfigure a device by clicking on it in the device list and selecting "Configure" or "Delete".
+If the stored token is revoked, Home Assistant shows a reauth notification.
+Enter the device credentials again; the new token is stored transparently.
 
 ## Entities
 
-After successful setup, the integration automatically creates sensors for all available energy management components in your Leaflet HEMS system. The specific entities created depend on your system configuration and the devices connected to your nymea instance.
+The integration creates one base device and four grouped devices:
 
-**Automatically Created Sensors:**
+| Group | Sensor | Unit | HA class |
+| --- | --- | --- | --- |
+| Grid Connection Point | Grid Import Power | W | power / measurement |
+| | Grid Export Power | W | power / measurement |
+| | Grid Import Energy | kWh | energy / total_increasing |
+| | Grid Export Energy | kWh | energy / total_increasing |
+| Generators | Generation Power | W | power / measurement |
+| | Generation Energy | kWh | energy / total_increasing |
+| Storage | Storage Power (+ charging, - discharging) | W | power / measurement |
+| | Storage Charging Power | W | power / measurement |
+| | Storage Discharging Power | W | power / measurement |
+| | Storage Energy Stored | kWh | energy / total_increasing |
+| | Storage Energy Provided | kWh | energy / total_increasing |
+| Household Consumption | Household Consumption Power | W | power / measurement |
+| | Household Consumption Energy | kWh | energy / total_increasing |
 
-*   **Grid Connection Meter (Root Meter)**
-    *   Grid Consumption (Netzbezug) - Power being drawn from the grid
-    *   Grid Feed-in (Netzeinspeisung) - Power being fed into the grid
-    *   Grid-related energy metrics and statistics
+There are intentionally **no per-thing battery/inverter entities**. This
+keeps the entity count stable even when devices are added or replaced.
 
-*   **Inverters**
-    *   PV Generation (PV-Erzeugung) - Power currently being generated by PV modules
-    *   Inverter performance metrics and statistics
+Household consumption is calculated by the Leaflet energy balance from the
+grid connection point, generators and storage. The integration exposes the
+calculated power directly and computes the energy counter as:
 
-*   **Batteries**
-    *   Battery Charge Level (Batterieladung) - State of charge of the battery
-    *   Battery Power (Batterieleistung) - Current power flow (charging/discharging)
-    *   Battery status and health metrics
+```
+consumption_energy =
+    grid_import_energy + generation_energy
+    + storage_energy_provided - storage_energy_stored
+    - grid_export_energy
+```
 
-*   **Additional Devices**
-    *   Other energy management devices as available in your system
+The grid energy counters come from the root meter state values in kWh; the
+generation counter is the sum of the configured PV inverter counters; the
+storage counters are the sums of the configured battery counters.
 
-All sensors are automatically initialized and updated in real-time as data becomes available from your Leaflet HEMS device.
+## Home Assistant Energy Dashboard
 
-## Troubleshooting
+Configure the Energy Dashboard under "Settings" > "Dashboards" > "Energy":
 
-### Integration Fails to Add
+| Dashboard field | Sensor |
+| --- | --- |
+| Grid consumption | `Grid Import Energy` |
+| Return to grid | `Grid Export Energy` |
+| Solar production | `Generation Energy` |
+| Battery energy in | `Storage Energy Stored` |
+| Battery energy out | `Storage Energy Provided` |
 
-- **"Cannot connect"**: Ensure the Leaflet HEMS device is powered on, connected to your network, and the nymea service is running on port 2222. Check your firewall settings.
-- **"No devices found" during discovery**: Ensure mDNS is enabled on your network and the Leaflet HEMS device is advertising the `_nymea._tcp.local` service. Try the manual setup option.
-- **"Cannot get UUID"**: This usually happens during manual setup if the handshake fails. Ensure the IP address and port are correct, and the device is accessible.
+The grouped power sensors are used automatically for the live flow display.
+The integration also provides a script for automated setups; see
+[`tests/e2e/README.md`](tests/e2e/README.md):
 
-### Entities Not Appearing
+```bash
+docker exec homeassistant python /config/e2e/setup_energy.py --title "<entry title>"
+docker exec homeassistant python /config/e2e/energy_checks.py --title "<entry title>" --validation-wait 360
+```
 
-- If sensors are not appearing after successful setup, ensure your Leaflet HEMS device has connected energy management components (grid meter, inverters, batteries).
-- Check that your device credentials are correct and the integration can successfully authenticate.
-- Verify that your Leaflet HEMS device is online and communicating properly with its connected components.
-- Check the Home Assistant logs for any error messages related to sensor initialization.
+`energy_checks.py` verifies all electricity energy and power points, the
+long-term statistics, plausible values (a single-family house with 8 kWp
+cannot accumulate GWh), and the Energy Dashboard validation result.
 
-### Logs
+## Data sources and units
 
-- Check the Home Assistant logs for detailed error messages. You can enable debug logging for the `leaflet_hems` integration in the Home Assistant configuration (`logger` section) to get more detailed information:
-  ```yaml
-  logger:
-    default: info
-    logs:
-      custom_components.leaflet_hems: debug
-  ```
+The integration uses the nymea JSON-RPC API:
 
-## Requirements
+- `Energy.GetPowerBalance` / `Energy.PowerBalanceChanged` for live power and
+  household consumption.
+- `Energy.GetRootMeter` to identify the grid connection meter.
+- `Integrations.GetStateValues` / `Integrations.StateChanged` for the root
+  meter, PV and battery state values.
+- `Hems.GetPvConfigurations`, `Hems.GetBatteryConfigurations` and the
+  corresponding configuration notifications to track generators and storage.
 
-- A working Home Assistant instance (2025.10.2 or newer).
-- A Consolinno Leaflet HEMS device with nymea framework.
-- Network access to the Leaflet HEMS device on port 2222 (TCP).
-- Python dependencies: `zeroconf`, `aiohttp`, `cryptography`. These are usually handled by HACS or Home Assistant's dependency management.
+Power values use **Watt**. Energy counters use **kWh**. The grid and PV
+counters are read from the corresponding nymea thing states; the legacy
+`Energy.GetPowerBalance` totals are not used for grid energy because older
+firmware versions can report them with an inconsistent Wh/kWh base.
 
 ## Development
 
-This integration is stable and actively maintained. The core functionality includes:
+### Unit tests
 
-- **Automatic Device Discovery**: Seamless network discovery of Leaflet HEMS devices
-- **Authentication**: Secure username/password authentication
-- **Real-time Data Fetching**: Continuous polling of energy data from nymea devices
-- **Sensor Creation**: Automatic creation of sensors for grid meters, inverters, and batteries
-- **Device Management**: Full device lifecycle management in Home Assistant
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pytest tests -q
+```
 
-### Running Tests
+The unit tests cover the persistent client, reconnect/backoff, keepalive,
+notification buffering, filtered snapshots, grouped data mapping, energy
+scaling/rounding, the sensor platform, the config flow and Zeroconf
+de-duplication.
 
-#### Host Machine Tests
+### Live tests against Home Assistant
 
-To run the unit tests for this integration on your host machine, you'll need Python and the development dependencies installed:
+The scripts in [`tests/e2e`](tests/e2e) run inside the Home Assistant
+container and use its WebSocket/REST API. They resolve config entries and
+entity ids dynamically and contain no device-specific identifiers. See
+[`tests/e2e/README.md`](tests/e2e/README.md).
 
-1.  Install dependencies: `pip install -r requirements.txt`
-2.  Run tests: `pytest tests/`
+## Troubleshooting
 
-#### Docker Environment for Testing
+- **Device not discovered**: mDNS must work between Home Assistant and the
+  Leaflet. Use manual setup with the device IP as a fallback.
+- **Cannot connect**: port `2222` must be reachable and `nymead` must be
+  running. The integration does not fall back to the unauthenticated
+  localhost interface.
+- **Sensors unavailable**: the connection is down or the token was revoked.
+  Check the Home Assistant logs and complete the reauth flow if prompted.
+- **Energy Dashboard shows no data**: make sure the six energy sensors above
+  are selected. New sensors need one recorder statistics cycle (about five
+  minutes) before the dashboard can show them.
 
-You can use Docker to run Home Assistant with the `leaflet_hems` integration for end-to-end testing.
+## Requirements
 
-**Prerequisites:**
-*   Docker installed and running.
-*   Docker Compose installed and running.
-
-**Setup:**
-
-1.  **Build and Start:**
-    *   Open a terminal in the root directory of this project (`ha-leaflet-hems`).
-    *   Build the custom Home Assistant image: `make build`
-    *   Start the Home Assistant instance: `make up`
-
-    The Home Assistant instance will be available at `http://localhost:8123`. The initial setup may take a few minutes. You can monitor the logs with `make logs`.
-
-2.  **Configuration in Home Assistant UI:**
-    *   Once Home Assistant is running, open `http://localhost:8123`.
-    *   Go to "Settings" > "Devices & Services".
-    *   Click "+ Add Integration".
-    *   Search for "Leaflet HEMS".
-    *   Follow the on-screen instructions to add your device (either via discovery or manually).
-
-3.  **Hot-Reloading During Development:**
-    *   The `docker-compose.override.yml` is set up to mount the `custom_components` directory from your host machine into the container. This means changes you make to the integration's Python files in `custom_components/leaflet_hems/` on your host should be immediately reflected in the running Docker container.
-    *   After making changes, Home Assistant might need to be reloaded. You can do this by:
-        *   Going to "Developer Tools" > "YAML Configuration" > "Reload" in the Home Assistant UI.
-        *   Or, restarting the Home Assistant service from the UI or via `make down && make up` (for more significant changes).
-
-**Common Docker Commands (using Makefile):**
-
-*   `make build`: Build the Docker image.
-*   `make up`: Start the container.
-*   `make down`: Stop the container.
-*   `make logs`: View container logs.
-*   `make clean`: Stop, remove containers, and prune volumes (resets Home Assistant config).
-*   `make rebuild`: Full rebuild and start.
-*   `make fresh`: Stop, prune, build, and start (clean slate).
-*   `make test_config_flow`: Run config flow tests from the host.
-*   `make shell`: Get a shell inside the running container for debugging.
-
-**Note on Docker Tests:**
-The `test_integration` and `test_config_flow` targets in the Makefile are primarily for running tests from your host machine against the Home Assistant instance (if tests were designed that way). Running tests *inside* the Docker container (e.g., `docker exec home_assistant python -m pytest /tests/`) is also possible but might require adjustments to how `pytest-hass` or other test discovery mechanisms work, especially if they rely on Home Assistant's internal APIs being fully operational. For now, host-based pytest is the primary method.
-
-## Contributing
-
-If you have suggestions or encounter bugs, please open an issue on the [GitHub repository](https://github.com/ljonka/ha-leaflet-hems/issues).
+- Home Assistant 2025.10.2 or newer.
+- A Consolinno Leaflet HEMS device with nymea and the Energy/Hems experience
+  plugins.
+- Network access to the device on port `2222` (TCP/TLS).
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License — see [LICENSE](LICENSE).
 
 ---
 
-**Disclaimer:** This is an unofficial integration. Use at your own risk. The author is not responsible for any damage caused by the use of this integration.
+**Disclaimer:** This is an unofficial integration. Use at your own risk. The
+author is not responsible for any damage caused by the use of this software.
